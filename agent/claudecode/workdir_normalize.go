@@ -51,7 +51,7 @@ func normalizeWindowsDriveLetter(path string) string {
 		return path
 	}
 	c := path[0]
-	if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+	if c < 'A' || (c > 'Z' && c < 'a') || c > 'z' {
 		return path
 	}
 	if c >= 'a' && c <= 'z' {
