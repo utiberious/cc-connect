@@ -14325,4 +14325,90 @@ func TestHandlePendingPermission_StalePermissionCallback_Dropped(t *testing.T) {
 			t.Fatalf("RespondPermission behavior = %q, want allow", rec.lastResult.Behavior)
 		}
 	})
+
+// heartbeatReconstructPlatform is a minimal platform stub that supports
+// ReplyContextReconstructor (required by ExecuteHeartbeat) and records
+// every Reply/Send invocation for assertion.
+type heartbeatReconstructPlatform struct {
+	stubPlatformEngine
+}
+
+func (p *heartbeatReconstructPlatform) ReconstructReplyCtx(sessionKey string) (any, error) {
+	return "hb-ctx:" + sessionKey, nil
+}
+
+// TestExecuteHeartbeat_Silent_EmptyResponseSuppressed is a regression
+// test for issue #355: when a heartbeat fires with silent=true and the
+// agent produces no output, the engine must NOT send the localized
+// "(空响应)" / "(empty response)" fallback to the user.
+func TestExecuteHeartbeat_Silent_EmptyResponseSuppressed(t *testing.T) {
+	platform := &heartbeatReconstructPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+
+	// Agent session that returns EventResult with empty content.
+	agentSession := newResultAgentSession("")
+	agent := &resultAgent{session: agentSession}
+
+	e := NewEngine("test", agent, []Platform{platform}, "", LangEnglish)
+	defer e.cancel()
+
+	if err := e.ExecuteHeartbeat("test:user-355", "Are you alive?", true); err != nil {
+		t.Fatalf("ExecuteHeartbeat: %v", err)
+	}
+
+	// Give the goroutine a moment to finish processing the EventResult.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(platform.getSent()) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	sent := platform.getSent()
+	for _, msg := range sent {
+		if strings.Contains(msg, "空响应") || strings.Contains(strings.ToLower(msg), "empty response") {
+			t.Errorf("silent heartbeat must not send empty-response fallback; got %q", msg)
+		}
+	}
+}
+
+// TestExecuteHeartbeat_NotSilent_EmptyResponseKept ensures the
+// non-silent heartbeat still produces the localized fallback when the
+// agent gives no output, so the fix for #355 is targeted.
+func TestExecuteHeartbeat_NotSilent_EmptyResponseKept(t *testing.T) {
+	platform := &heartbeatReconstructPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+
+	agentSession := newResultAgentSession("")
+	agent := &resultAgent{session: agentSession}
+
+	e := NewEngine("test", agent, []Platform{platform}, "", LangEnglish)
+	defer e.cancel()
+
+	if err := e.ExecuteHeartbeat("test:user-355b", "ping", false); err != nil {
+		t.Fatalf("ExecuteHeartbeat: %v", err)
+	}
+
+	// The non-silent path sends a "💓 heartbeat" notice first, then
+	// the fallback if the agent gave no output. Wait for both.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(platform.getSent()) >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	sent := platform.getSent()
+	if len(sent) < 1 || !strings.Contains(sent[0], "heartbeat") {
+		t.Errorf("expected first sent message to contain 'heartbeat', got %v", sent)
+	}
+	var sawEmpty bool
+	for _, msg := range sent[1:] {
+		if strings.Contains(msg, "空响应") || strings.Contains(strings.ToLower(msg), "empty response") {
+			sawEmpty = true
+		}
+	}
+	if !sawEmpty {
+		t.Errorf("non-silent heartbeat with empty agent output should still send empty-response fallback; sent=%v", sent)
+	}
 }
