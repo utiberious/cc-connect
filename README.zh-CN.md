@@ -87,6 +87,11 @@ MiniMax M3 突破 Coding 与 Agentic AI 前沿，基于 MiniMax Sparse Attention
 </tr>
 
 <tr>
+<td width="150"><a href="https://runapi.co/register?aff=4BXa"><img src="assets/sponsors/runapi.jpg" alt="RunAPI" width="120"></a></td>
+<td>感谢 RunAPI 对本项目的赞助！RunAPI 是高效稳定的API OpenRouter平替平台，一个 API Key 即可访问 OpenAI、Claude、Gemini、DeepSeek、Grok 等 150+ 主流模型，低至 1 折，极其稳定，可以无缝兼容 Claude Code、OpenClaw 等工具。RunAPI 为 cc-connect的用户提供专属福利：注册联系管理员即可领取￥7的免费额度</td>
+</tr>
+
+<tr>
 <td width="150"><a href="https://www.aicodemirror.com/register?invitecode=KDHMUP"><img src="assets/sponsors/aicodemirror.jpg" alt="AICodeMirror" width="120"></a></td>
 <td>感谢 AICodeMirror 对本项目的赞助！AICodeMirror 提供 Claude Code / Codex / Gemini CLI 官方高稳定性中转服务，企业级并发、快速开票、24小时专属技术支持。Claude Code / Codex / Gemini 官方渠道价格仅为原价的 38% / 2% / 9%，充值还有额外折扣！AICodeMirror 为 CC 用户专属福利：通过 <a href="https://www.aicodemirror.com/register?invitecode=KDHMUP">此链接</a> 注册首充享受 20% 折扣，企业客户最高可享 25% 折扣！</td>
 </tr>
