@@ -59,6 +59,7 @@ type claudeSession struct {
 	// Stop hook timeout. The wait ends as soon as the process exits,
 	// so typical shutdowns take seconds, not the full timeout.
 	gracefulStopTimeout time.Duration
+	ccHooks             *ccPermissionHookRunner // Claude Code PermissionRequest hook runner
 
 	// startupWarning holds a one-time message to surface to the IM user at
 	// session start (e.g. when a permission mode was silently downgraded).
@@ -205,6 +206,13 @@ func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs 
 	if len(extraEnv) > 0 {
 		env = core.MergeEnv(env, extraEnv)
 	}
+	// Signal to PermissionRequest hooks that they are running inside
+	// cc-connect. Hooks can check this env var to skip LLM calls on
+	// the Claude Code side (the hook result is ignored anyway when
+	// --permission-prompt-tool stdio is active). cc-connect runs the
+	// hook itself without this env var, so the real work happens only
+	// once.
+	env = core.MergeEnv(env, []string{"CC_CONNECT_PERMISSION_HOOK_SKIP=1"})
 	// When run_as_user is set, strip the supervisor's environment down to
 	// the allowlist before passing it to sudo. sudo --preserve-env also
 	// enforces this, but filtering here makes the cc-connect spawn argv
@@ -256,6 +264,7 @@ func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs 
 		cancel:              cancel,
 		done:                make(chan struct{}),
 		gracefulStopTimeout: 120 * time.Second,
+		ccHooks:             newCCPermissionHookRunner(workDir),
 		startupWarning:      rootDowngradeWarning,
 	}
 	cs.setPermissionMode(mode)
@@ -630,6 +639,29 @@ func (cs *claudeSession) handleControlRequest(raw map[string]any) {
 		return
 	}
 
+	// Check Claude Code's PermissionRequest hooks before forwarding to platform.
+	hctx := hookContext{
+		sessionID:      cs.CurrentSessionID(),
+		toolName:       toolName,
+		toolInput:      input,
+		cwd:            cs.workDir,
+		permissionMode: cs.permissionModeValue(),
+		transcriptPath: cs.transcriptPath(),
+	}
+	if decision, ok := cs.ccHooks.tryHook(cs.ctx, hctx); ok {
+		slog.Info("claudeSession: hook decided",
+			"request_id", requestID, "tool", toolName, "behavior", decision.Behavior)
+		result := core.PermissionResult{
+			Behavior:     decision.Behavior,
+			UpdatedInput: input,
+		}
+		if decision.Behavior == "deny" && decision.Message != "" {
+			result.Message = decision.Message
+		}
+		_ = cs.RespondPermission(requestID, result)
+		return
+	}
+
 	slog.Info("claudeSession: permission request", "request_id", requestID, "tool", toolName)
 	evt := core.Event{
 		Type:         core.EventPermissionRequest,
@@ -823,6 +855,33 @@ func (cs *claudeSession) Events() <-chan core.Event {
 func (cs *claudeSession) CurrentSessionID() string {
 	v, _ := cs.sessionID.Load().(string)
 	return v
+}
+
+func (cs *claudeSession) permissionModeValue() string {
+	v, _ := cs.permissionMode.Load().(string)
+	return v
+}
+
+// transcriptPath returns the path to the Claude Code JSONL transcript
+// for the current session, or "" if it cannot be determined.
+func (cs *claudeSession) transcriptPath() string {
+	sessionID := cs.CurrentSessionID()
+	if sessionID == "" || cs.workDir == "" {
+		return ""
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	absWorkDir, err := filepath.Abs(cs.workDir)
+	if err != nil {
+		return ""
+	}
+	projectDir := findProjectDir(homeDir, absWorkDir)
+	if projectDir == "" {
+		return ""
+	}
+	return filepath.Join(projectDir, sessionID+".jsonl")
 }
 
 // GetModel returns the model id reported by the CLI's init event (e.g.
