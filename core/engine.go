@@ -1247,25 +1247,28 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		effectivePlatform = &mutePlatform{targetPlatform}
 	}
 
+	// Determine whether this cron job should suppress the start notification.
+	// This is also used to suppress the empty-response fallback (see SilentEmpty
+	// on the Message below) so silent cron jobs don't disturb the user with
+	// "(空响应)" / "(empty response)" when the agent has no output.
+	silent := false
+	if e.cronScheduler != nil {
+		silent = e.cronScheduler.IsSilent(job)
+	}
+
 	// Notify user that a cron job is executing (unless silent/muted)
 	// Note: this notification uses targetPlatform directly, not the tracking wrapper,
 	// so it won't count as a "meaningful delivery" for empty response detection.
-	if !job.Mute {
-		silent := false
-		if e.cronScheduler != nil {
-			silent = e.cronScheduler.IsSilent(job)
-		}
-		if !silent {
-			desc := job.Description
-			if desc == "" {
-				if job.IsShellJob() {
-					desc = truncateStr(job.Exec, 40)
-				} else {
-					desc = truncateStr(job.Prompt, 40)
-				}
+	if !job.Mute && !silent {
+		desc := job.Description
+		if desc == "" {
+			if job.IsShellJob() {
+				desc = truncateStr(job.Exec, 40)
+			} else {
+				desc = truncateStr(job.Prompt, 40)
 			}
-			e.send(targetPlatform, replyCtx, fmt.Sprintf("⏰ %s", desc))
 		}
+		e.send(targetPlatform, replyCtx, fmt.Sprintf("⏰ %s", desc))
 	}
 
 	if job.IsShellJob() {
@@ -1291,6 +1294,10 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		Content:      content,
 		ReplyCtx:     replyCtx,
 		ModeOverride: job.Mode,
+		// Silent cron jobs: suppress the empty-response fallback so a silent
+		// job whose agent produces no output doesn't disturb the user.
+		// Symmetric with ExecuteHeartbeat's SilentEmpty behavior (issue #355).
+		SilentEmpty: silent,
 	}
 
 	// Resolve workspace-specific agent and sessions for multi-workspace mode.
@@ -4858,16 +4865,22 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				fullResponse = strings.Join(textParts, "")
 			}
 			if fullResponse == "" {
-				// Silent heartbeat: if the agent produced no output,
-				// drop the turn entirely instead of sending the
-				// localized "(空响应)" / "(empty response)" fallback.
-				// Non-silent heartbeats and normal user messages are
-				// unaffected — they fall through to the i18n fallback.
+				// Silent heartbeat / cron: if the agent produced no
+				// output, drop the turn entirely instead of sending
+				// the localized "(空响应)" / "(empty response)" fallback.
+				// Non-silent heartbeats / cron jobs and normal user
+				// messages are unaffected — they fall through to the
+				// i18n fallback. Routing through the NO_REPLY marker
+				// ensures the existing silent-reply path (preview
+				// discard, no platform send, hook emit skipped) handles
+				// the cleanup uniformly — see isSilentReply at 4918.
 				state.mu.Lock()
 				suppress := state.silentEmpty
 				state.mu.Unlock()
 				if !suppress {
 					fullResponse = e.i18n.T(MsgEmptyResponse)
+				} else {
+					fullResponse = silentReplyMarker
 				}
 			}
 
@@ -15481,6 +15494,13 @@ func contextIndicatorText(inputTokens int) string {
 // Used to strip such markers from delivered text — the ctx indicator is now
 // rendered exclusively in the reply footer.
 var ctxSelfReportRe = regexp.MustCompile(`(?m)\n?\[ctx: ~\d+%\]`)
+
+// silentReplyMarker is the canonical NO_REPLY marker. We substitute this
+// sentinel into fullResponse when a silent heartbeat / cron turn produces
+// no agent output, so the existing silent-reply branch (isSilentReply at
+// EventResult) handles preview cleanup uniformly without sending an empty
+// message to the platform. Matches silentReplyRe below.
+const silentReplyMarker = "NO_REPLY"
 
 // silentReplyRe matches a bare NO_REPLY marker (case-insensitive, optional surrounding whitespace).
 // When the agent emits exactly this as its full response, the platform send is suppressed
