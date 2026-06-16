@@ -180,6 +180,10 @@ MiniMax M3 突破 Coding 与 Agentic AI 前沿，基于 MiniMax Sparse Attention
 </p>
 
 
+## 🔧 紧急修复: v1.3.4 (2026-06-16)
+
+修复 v1.3.3 在 Windows 上的回归 —— Windows 用户运行 claudecode agent 时所有消息都收不到回复:v1.3.3 把系统 prompt 扩到了约 9 KB,但 Windows `cmd.exe` 命令行总长有 8192 字节限制,导致 `claude.exe` 无法启动。v1.3.4 改用 `--append-system-prompt-file` 通过文件传递 prompt（不再走命令行）。**Windows + claudecode 用户请立即升级**。不需要改配置。Linux / macOS / 非 claudecode 用户不受 v1.3.3 这个 bug 影响。详见 [`changelogs/v1.3.4.md`](./changelogs/v1.3.4.md) 与 [#1376](https://github.com/chenhg5/cc-connect/issues/1376)。
+
 ## 🆕 v1.3.3 更新了什么
 
 1.3.3 系列首个正式版 —— 把 beta.1 → beta.5（自 v1.3.2 起约 235 个 PR）与 7 个 post-beta 修复一并稳定下来。亮点：

@@ -1,5 +1,34 @@
 # Changelog
 
+## v1.3.4 (2026-06-16) — Windows hotfix
+
+Emergency single-fix release for a Windows-only regression introduced in v1.3.3.
+**Upgrade strongly recommended for Windows users running the claudecode agent.**
+Linux / macOS and non-claudecode users are unaffected by the v1.3.3 bug and may
+upgrade at leisure. No config changes required. See `changelogs/v1.3.4.md` for the
+full root-cause writeup and verification notes.
+
+### Fixed
+- **Windows: all messages silently never reply on v1.3.3** ([#1376](https://github.com/chenhg5/cc-connect/issues/1376)).
+  Root cause: v1.3.3 expanded `core.AgentSystemPrompt()` from 2707 → 9055 bytes,
+  which busted Windows `cmd.exe`'s 8192-byte command-line limit when cc-connect
+  spawned `claude.exe` with `--append-system-prompt <inline 9KB>`. Fix: pass the
+  prompt to `claude.exe` via `--append-system-prompt-file <path>` instead of inline
+  (single shared file at `<data_dir>/agent-prompts/cc-connect-system.md` for the
+  99% path; per-spawn temp file for the 1% edge cases like Slack / Weixin / MAX /
+  user-configured `append_system_prompt`). Prompt content is **identical** to
+  v1.3.3 — only the delivery mechanism changed.
+
+### Scope
+3 files changed, +323/-9, all in `agent/claudecode/`. No changes elsewhere.
+
+### Credits
+Reporters [@secountAiAccount](https://github.com/secountAiAccount) and
+[@softxyz1](https://github.com/softxyz1) for unblocking us within hours of v1.3.3
+going stable.
+
+---
+
 ## v1.3.3 (2026-06-15)
 
 First stable release of the 1.3.3 series. Stabilizes the v1.3.3-beta.1 → v1.3.3-beta.5

@@ -180,6 +180,10 @@ MiniMax-M3 pushes the frontier of coding and agentic AI, with a 1M-token context
 </p>
 
 
+## 🔧 Hotfix: v1.3.4 (2026-06-16)
+
+Emergency fix for a Windows-only regression in v1.3.3 — on Windows the claudecode agent silently failed to start sessions (all messages got no reply) because v1.3.3's expanded system prompt (~9 KB) busted Windows `cmd.exe`'s 8192-byte cmdline limit. v1.3.4 passes the prompt to `claude.exe` via a file (`--append-system-prompt-file`) instead of inline. **If you're on Windows running claudecode, upgrade now.** No config changes required. Linux / macOS / non-claudecode users were not affected. See [`changelogs/v1.3.4.md`](./changelogs/v1.3.4.md) and [#1376](https://github.com/chenhg5/cc-connect/issues/1376).
+
 ## 🆕 What’s New in v1.3.3
 
 First stable of the 1.3.3 series — stabilizes beta.1 → beta.5 (≈ 235 PRs since v1.3.2) plus 7 post-beta fixes. Highlights:
