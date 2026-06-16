@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -455,6 +457,129 @@ func TestBuildAppendSystemPrompt(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestEnsureSharedSystemPromptFile_WritesOnceAndReuses covers the 99%
+// case for the #1376 workaround. The cc-connect default
+// AgentSystemPrompt is written once to <ccDataDir>/agent-prompts/
+// cc-connect-system.md and reused across spawns — no per-spawn write,
+// no cleanup. claude only reads the file, so reuse is safe under
+// concurrent spawns.
+func TestEnsureSharedSystemPromptFile_WritesOnceAndReuses(t *testing.T) {
+	dir := t.TempDir()
+	content := "## cc-connect prompt\n" + makeFiller(10*1024)
+
+	// First call must create the file.
+	path1, err := ensureSharedSystemPromptFile(dir, content)
+	if err != nil {
+		t.Fatalf("first ensure: %v", err)
+	}
+	if !strings.HasSuffix(filepath.ToSlash(path1), "agent-prompts/cc-connect-system.md") {
+		t.Errorf("path %q does not end in agent-prompts/cc-connect-system.md", path1)
+	}
+	got, err := os.ReadFile(path1)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if string(got) != content {
+		t.Fatalf("content mismatch after first write")
+	}
+	stat1, err := os.Stat(path1)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+
+	// Second call with identical content must NOT rewrite the file
+	// (mtime stays the same). This is what gives the common case
+	// zero per-spawn overhead.
+	time.Sleep(20 * time.Millisecond)
+	path2, err := ensureSharedSystemPromptFile(dir, content)
+	if err != nil {
+		t.Fatalf("second ensure: %v", err)
+	}
+	if path2 != path1 {
+		t.Errorf("path drifted between calls: %q vs %q", path1, path2)
+	}
+	stat2, err := os.Stat(path2)
+	if err != nil {
+		t.Fatalf("stat 2: %v", err)
+	}
+	if !stat1.ModTime().Equal(stat2.ModTime()) {
+		t.Errorf("file was rewritten despite identical content: mtime %v -> %v",
+			stat1.ModTime(), stat2.ModTime())
+	}
+}
+
+// TestEnsureSharedSystemPromptFile_RewritesOnContentChange covers
+// cc-connect upgrades: when AgentSystemPrompt content changes between
+// releases, the shared file must be refreshed automatically.
+func TestEnsureSharedSystemPromptFile_RewritesOnContentChange(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := ensureSharedSystemPromptFile(dir, "v1"); err != nil {
+		t.Fatalf("ensure v1: %v", err)
+	}
+	path, err := ensureSharedSystemPromptFile(dir, "v2 — upgraded prompt")
+	if err != nil {
+		t.Fatalf("ensure v2: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if string(got) != "v2 — upgraded prompt" {
+		t.Fatalf("file did not refresh after content change: got %q", string(got))
+	}
+}
+
+// TestEnsureSharedSystemPromptFile_EmptyDirUsesTempDir guards the
+// degraded path where ccDataDir was not injected (e.g. older host
+// code or test harnesses) — the shared file still lands somewhere
+// writable instead of failing the spawn.
+func TestEnsureSharedSystemPromptFile_EmptyDirUsesTempDir(t *testing.T) {
+	path, err := ensureSharedSystemPromptFile("", "hello")
+	if err != nil {
+		t.Fatalf("ensure with empty dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+	if !strings.Contains(filepath.ToSlash(path), "/agent-prompts/cc-connect-system.md") {
+		t.Errorf("unexpected fallback path: %q", path)
+	}
+}
+
+// TestWriteTempAppendPromptFile_UniquePerCall covers the 1% edge case:
+// when the prompt includes per-session pieces (platform formatting or
+// user append) two concurrent spawns must each get their own file so
+// they cannot overwrite each other's content before claude reads it.
+func TestWriteTempAppendPromptFile_UniquePerCall(t *testing.T) {
+	// dir is auto-cleaned by t.TempDir(), so per-file Remove is unnecessary.
+	dir := t.TempDir()
+	a, err := writeTempAppendPromptFile(dir, "session A")
+	if err != nil {
+		t.Fatalf("write A: %v", err)
+	}
+	b, err := writeTempAppendPromptFile(dir, "session B")
+	if err != nil {
+		t.Fatalf("write B: %v", err)
+	}
+	if a == b {
+		t.Fatalf("two writeTempAppendPromptFile calls returned the same path %q "+
+			"— concurrent customised sessions would overwrite each other", a)
+	}
+
+	// Files must contain their own content (no cross-talk).
+	gotA, _ := os.ReadFile(a)
+	gotB, _ := os.ReadFile(b)
+	if string(gotA) != "session A" || string(gotB) != "session B" {
+		t.Errorf("cross-talk: A=%q B=%q", string(gotA), string(gotB))
+	}
+}
+
+func makeFiller(n int) string {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = 'a' + byte(i%26)
+	}
+	return string(b)
 }
 
 func helperCommand(ctx context.Context, mode string) *exec.Cmd {

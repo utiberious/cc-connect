@@ -64,6 +64,14 @@ type claudeSession struct {
 	// startupWarning holds a one-time message to surface to the IM user at
 	// session start (e.g. when a permission mode was silently downgraded).
 	startupWarning string
+
+	// promptFilePath is the per-spawn temp file holding the merged
+	// content for --append-system-prompt-file when this session needs
+	// platform- or user-specific append text that the shared
+	// cc-connect-system.md cannot represent. Removed on Close. Empty
+	// when the session reuses the shared file (the common 99% case)
+	// or when there is nothing to append.
+	promptFilePath string
 }
 
 // StartupWarning implements core.StartupWarner. Returns a non-empty string
@@ -71,11 +79,117 @@ type claudeSession struct {
 // know about (e.g. bypassPermissions downgraded to auto under root).
 func (cs *claudeSession) StartupWarning() string { return cs.startupWarning }
 
+// sharedSystemPromptRelPath is the location under ccDataDir where the
+// shared cc-connect system prompt file lives. Reused across every spawn
+// that doesn't need per-session customization (the 99% case).
+const sharedSystemPromptRelPath = "agent-prompts/cc-connect-system.md"
+
+// ensureSharedSystemPromptFile lazily writes <ccDataDir>/agent-prompts/
+// cc-connect-system.md with the cc-connect default AgentSystemPrompt
+// content, returning the path. The file is the workaround for the
+// Windows 8192-byte command-line limit (issue #1376): cc-connect's
+// built-in prompt is ~9KB on its own, so passing it inline via
+// --append-system-prompt blows past the cap regardless of whether the
+// user configured any customization.
+//
+// The file is only (re)written when missing or when its content differs
+// from the current AgentSystemPrompt() — this lets cc-connect upgrades
+// refresh the prompt automatically without per-spawn overhead. claude
+// only reads the file at startup and never writes it, so there is no
+// concurrent-write race even when multiple sessions spawn at once.
+//
+// If ccDataDir is empty (unlikely in production, but possible in tests),
+// the file lands in os.TempDir.
+func ensureSharedSystemPromptFile(ccDataDir, content string) (string, error) {
+	base := ccDataDir
+	if base == "" {
+		base = os.TempDir()
+	}
+	dir := filepath.Join(base, "agent-prompts")
+	path := filepath.Join(base, sharedSystemPromptRelPath)
+
+	if existing, err := os.ReadFile(path); err == nil && string(existing) == content {
+		return path, nil
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	if err := writeFileAtomic(path, []byte(content), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// writeTempAppendPromptFile writes the merged prompt content to a
+// per-spawn temp file under ccDataDir/agent-prompts/, returning the
+// path. Used only when the prompt has session-specific bits (platform
+// FormattingInstructions or user-configured append_system_prompt) that
+// the shared file cannot represent. A unique name from CreateTemp
+// avoids two concurrent customised sessions overwriting each other.
+//
+// The caller is responsible for removing the file on session Close.
+func writeTempAppendPromptFile(ccDataDir, content string) (string, error) {
+	base := ccDataDir
+	if base == "" {
+		base = os.TempDir()
+	}
+	dir := filepath.Join(base, "agent-prompts")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	f, err := os.CreateTemp(dir, "cc-connect-system-*.md")
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.WriteString(content); err != nil {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
+}
+
+// writeFileAtomic writes data to path via a temp file + rename, so a
+// crash mid-write does not leave a half-written prompt file that the
+// next spawn would mistake for valid content.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, ".cc-connect-system-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Chmod(perm); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
 // buildAppendSystemPrompt concatenates the cc-connect functionality prompt,
 // platform formatting instructions, and the user's custom append prompt into
-// the single string passed to Claude's --append-system-prompt flag. That flag
-// only honors its last occurrence (a second flag overwrites the first), so all
-// appended content must be merged here. Returns "" when nothing is to append.
+// the single string passed to Claude's --append-system-prompt-file flag.
+// That flag only honors its last occurrence (a second flag overwrites the
+// first), so all appended content must be merged here. Returns "" when
+// nothing is to append.
 func buildAppendSystemPrompt(agentPrompt, platformPrompt, userAppend string) string {
 	var parts []string
 	if agentPrompt != "" {
@@ -90,7 +204,7 @@ func buildAppendSystemPrompt(agentPrompt, platformPrompt, userAppend string) str
 	return strings.Join(parts, "\n")
 }
 
-func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs []string, cliArgsFlag string, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt string, allowedTools, disallowedTools []string, pluginDirs []string, extraEnv []string, platformPrompt string, disableVerbose bool, spawnOpts core.SpawnOptions, maxContextTokens int) (*claudeSession, error) {
+func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs []string, cliArgsFlag string, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt string, allowedTools, disallowedTools []string, pluginDirs []string, extraEnv []string, platformPrompt string, disableVerbose bool, spawnOpts core.SpawnOptions, maxContextTokens int, ccDataDir string) (*claudeSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 
 	// Claude Code rejects bypassPermissions when running as root.
@@ -144,11 +258,42 @@ func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs 
 	}
 
 	// Append the cc-connect functionality prompt, platform formatting hints,
-	// and the user's custom append prompt — all as a single flag. Claude's
-	// --append-system-prompt only honors its last occurrence, so the pieces
-	// must be concatenated here rather than passed as repeated flags.
+	// and the user's custom append prompt — via Claude's
+	// --append-system-prompt-file flag (not --append-system-prompt). Writing
+	// to a file avoids the Windows 8192-byte command-line limit (#1376):
+	// AgentSystemPrompt is ~9KB on its own and grew past the cap in v1.3.3,
+	// so even users with no customization need this workaround.
+	//
+	// Two paths exist to keep the common case zero-overhead:
+	//   • 99% case (no platform formatting, no user append) — reuse the
+	//     shared cc-connect-system.md file written once at startup; no
+	//     per-spawn write, no cleanup needed.
+	//   • 1% edge case (Slack/Weixin/MAX platform formatting or user-set
+	//     append_system_prompt) — write a per-spawn temp file containing
+	//     the merged content, removed on Close.
+	//
+	// Claude only reads the file at startup and never writes it, so the
+	// shared file is safe under concurrent spawns.
+	var promptFilePath string
+	var promptFileIsShared bool
 	if appended := buildAppendSystemPrompt(core.AgentSystemPrompt(), platformPrompt, appendSystemPrompt); appended != "" {
-		innerArgs = append(innerArgs, "--append-system-prompt", appended)
+		if platformPrompt == "" && appendSystemPrompt == "" {
+			path, err := ensureSharedSystemPromptFile(ccDataDir, appended)
+			if err != nil {
+				cancel()
+				return nil, fmt.Errorf("claudeSession: ensure shared prompt file: %w", err)
+			}
+			promptFilePath = path
+			promptFileIsShared = true
+		} else {
+			path, err := writeTempAppendPromptFile(ccDataDir, appended)
+			if err != nil {
+				cancel()
+				return nil, fmt.Errorf("claudeSession: write per-spawn prompt file: %w", err)
+			}
+			promptFilePath = path
+		}
+		innerArgs = append(innerArgs, "--append-system-prompt-file", promptFilePath)
 	}
 
 	if effort != "" {
@@ -269,8 +414,20 @@ func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs 
 	cmd.Stderr = &stderrBuf
 
 	if err := cmd.Start(); err != nil {
+		if promptFilePath != "" && !promptFileIsShared {
+			_ = os.Remove(promptFilePath)
+		}
 		cancel()
 		return nil, fmt.Errorf("claudeSession: start: %w", err)
+	}
+
+	// Only remember the prompt path for cleanup when it is the per-spawn
+	// temp variant. The shared cc-connect-system.md file is reused across
+	// all sessions and must never be deleted by an individual session's
+	// Close.
+	var cleanupPromptPath string
+	if !promptFileIsShared {
+		cleanupPromptPath = promptFilePath
 	}
 
 	cs := &claudeSession{
@@ -284,6 +441,7 @@ func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs 
 		gracefulStopTimeout: 120 * time.Second,
 		ccHooks:             newCCPermissionHookRunner(workDir),
 		startupWarning:      rootDowngradeWarning,
+		promptFilePath:      cleanupPromptPath,
 	}
 	cs.setPermissionMode(mode)
 	cs.sessionID.Store(sessionID)
@@ -969,6 +1127,15 @@ func (cs *claudeSession) Alive() bool {
 }
 
 func (cs *claudeSession) Close() error {
+	// Best-effort cleanup of the --append-system-prompt-file temp file on
+	// every exit path. The file is small (~9KB) and OS temp cleanup also
+	// eventually claims it, but explicit removal keeps workdirs tidy.
+	defer func() {
+		if cs.promptFilePath != "" {
+			_ = os.Remove(cs.promptFilePath)
+		}
+	}()
+
 	// Phase 1: Close stdin to signal EOF. Claude Code exits cleanly on
 	// stdin close, running Stop hooks (e.g. claude-mem session summary).
 	cs.stdinMu.Lock()
