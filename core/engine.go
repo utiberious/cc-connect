@@ -285,6 +285,8 @@ type Engine struct {
 	workspacePool                *workspacePool
 	initFlows                    map[string]*workspaceInitFlow // workspace channel key → init state
 	initFlowsMu                  sync.Mutex
+	sendWorkDirMu                sync.RWMutex
+	sendWorkDirs                 map[string]string // sessionKey → work_dir assigned by send --cwd
 
 	// Terminal observation (--observe)
 	observeEnabled    bool
@@ -558,6 +560,7 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 		skills:                NewSkillRegistry(),
 		aliases:               make(map[string]string),
 		interactiveStates:     make(map[string]*interactiveState),
+		sendWorkDirs:          make(map[string]string),
 		platformReady:         make(map[Platform]bool),
 		startedAt:             time.Now(),
 		streamPreview:         DefaultStreamPreviewCfg(),
@@ -2610,7 +2613,17 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	var wsAgent Agent
 	var wsSessions *SessionManager
 	var resolvedWorkspace string
-	if e.multiWorkspace {
+	if forcedWorkDir := e.sendWorkDirForSession(msg.SessionKey); forcedWorkDir != "" {
+		e.bindSendWorkDir(msg.SessionKey, forcedWorkDir)
+		var err error
+		wsAgent, wsSessions, err = e.getOrCreateWorkspaceAgent(forcedWorkDir)
+		if err != nil {
+			slog.Error("failed to create send work_dir agent", "work_dir", forcedWorkDir, "err", err)
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf("Failed to initialize workspace: %v", err))
+			return
+		}
+		resolvedWorkspace = forcedWorkDir
+	} else if e.multiWorkspace {
 		channelID := effectiveChannelID(msg)
 		channelKey := effectiveWorkspaceChannelKey(msg)
 		workspace, channelName, err := e.resolveWorkspace(p, channelID)
@@ -2657,7 +2670,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	sessions := e.sessions
 	agent := e.agent
 	interactiveKey := msg.SessionKey
-	if e.multiWorkspace && wsSessions != nil {
+	if resolvedWorkspace != "" && wsSessions != nil {
 		sessions = wsSessions
 		agent = wsAgent
 		interactiveKey = resolvedWorkspace + ":" + msg.SessionKey
@@ -3528,10 +3541,14 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 // getOrCreateWorkspaceAgent returns (or creates) a per-workspace agent and session manager.
 // workspace must be a normalized path (from resolveWorkspace or normalizeWorkspacePath).
 func (e *Engine) getOrCreateWorkspaceAgent(workspace string) (Agent, *SessionManager, error) {
+	e.interactiveMu.Lock()
 	if e.workspacePool == nil {
-		return nil, nil, fmt.Errorf("workspace pool not initialized (multi-workspace mode not enabled)")
+		e.workspacePool = newWorkspacePool(DefaultWorkspaceIdleTimeout)
 	}
-	ws := e.workspacePool.GetOrCreate(workspace)
+	pool := e.workspacePool
+	e.interactiveMu.Unlock()
+
+	ws := pool.GetOrCreate(workspace)
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 
@@ -10400,7 +10417,28 @@ func (e *Engine) SendToSession(sessionKey, message string) error {
 	return e.SendToSessionWithAttachments(sessionKey, message, nil, nil, nil, false)
 }
 
+// SendOptions controls optional behavior for external send callers.
+type SendOptions struct {
+	WorkDir string
+	AtUsers []string
+	AtAll   bool
+}
+
 func (e *Engine) SendToSessionWithAttachments(sessionKey, message string, images []ImageAttachment, files []FileAttachment, atUsers []string, atAll bool) error {
+	return e.SendToSessionWithOptions(sessionKey, message, images, files, SendOptions{AtUsers: atUsers, AtAll: atAll})
+}
+
+func (e *Engine) SendToSessionWithOptions(sessionKey, message string, images []ImageAttachment, files []FileAttachment, opts SendOptions) error {
+	if strings.TrimSpace(opts.WorkDir) != "" {
+		workDir, useWorkDirSession, err := e.resolveSendWorkDir(opts.WorkDir)
+		if err != nil {
+			return err
+		}
+		if useWorkDirSession {
+			return e.SendToSessionInWorkDir(sessionKey, message, images, files, workDir, opts.AtUsers, opts.AtAll)
+		}
+	}
+
 	state, p, replyCtx, err := e.resolveOutboundSessionTarget(sessionKey, len(images) > 0 || len(files) > 0)
 	if err != nil {
 		return err
@@ -10436,9 +10474,9 @@ func (e *Engine) SendToSessionWithAttachments(sessionKey, message string, images
 			return err
 		}
 		// Use AtMentionSender when @users specified and platform supports it
-		if len(atUsers) > 0 || atAll {
+		if len(opts.AtUsers) > 0 || opts.AtAll {
 			if atSender, ok := p.(AtMentionSender); ok {
-				if err := atSender.ReplyWithAt(e.ctx, replyCtx, message, atUsers, atAll); err != nil {
+				if err := atSender.ReplyWithAt(e.ctx, replyCtx, message, opts.AtUsers, opts.AtAll); err != nil {
 					return err
 				}
 			} else {
@@ -10474,6 +10512,257 @@ func (e *Engine) SendToSessionWithAttachments(sessionKey, message string, images
 		}
 	}
 	return nil
+}
+
+type sendTarget struct {
+	state      *interactiveState
+	platform   Platform
+	replyCtx   any
+	sessionKey string
+}
+
+func (e *Engine) SendToSessionInWorkDir(sessionKey, message string, images []ImageAttachment, files []FileAttachment, workDir string, atUsers []string, atAll bool) error {
+	if message == "" && len(images) == 0 && len(files) == 0 {
+		return fmt.Errorf("message or attachment is required")
+	}
+	if (len(images) > 0 || len(files) > 0) && !e.attachmentSendEnabled {
+		return ErrAttachmentSendDisabled
+	}
+
+	target, err := e.resolveSendTarget(sessionKey, len(images) > 0 || len(files) > 0)
+	if err != nil {
+		return err
+	}
+	if target.platform == nil {
+		return fmt.Errorf("no active session found (key=%q)", sessionKey)
+	}
+
+	_, sessions, err := e.getOrCreateWorkspaceAgent(workDir)
+	if err != nil {
+		return err
+	}
+	session := sessions.NewSession(target.sessionKey, "send")
+	if message != "" {
+		session.AddHistory("assistant", message)
+	}
+	sessions.Save()
+	e.bindSendWorkDir(target.sessionKey, workDir)
+
+	var imageSender ImageSender
+	if len(images) > 0 {
+		var ok bool
+		imageSender, ok = target.platform.(ImageSender)
+		if !ok {
+			return fmt.Errorf("platform %s: %w", target.platform.Name(), ErrNotSupported)
+		}
+	}
+
+	var fileSender FileSender
+	if len(files) > 0 {
+		var ok bool
+		fileSender, ok = target.platform.(FileSender)
+		if !ok {
+			return fmt.Errorf("platform %s: %w", target.platform.Name(), ErrNotSupported)
+		}
+	}
+
+	if message != "" {
+		if err := e.waitOutgoing(target.platform); err != nil {
+			return err
+		}
+		if len(atUsers) > 0 || atAll {
+			if atSender, ok := target.platform.(AtMentionSender); ok {
+				if err := atSender.ReplyWithAt(e.ctx, target.replyCtx, message, atUsers, atAll); err != nil {
+					return err
+				}
+			} else if err := target.platform.Send(e.ctx, target.replyCtx, message); err != nil {
+				return err
+			}
+		} else {
+			if err := target.platform.Send(e.ctx, target.replyCtx, message); err != nil {
+				return err
+			}
+		}
+		if target.state != nil {
+			target.state.mu.Lock()
+			target.state.sideText = strings.TrimSpace(message)
+			target.state.mu.Unlock()
+		}
+	}
+	for _, img := range images {
+		if err := e.waitOutgoing(target.platform); err != nil {
+			return err
+		}
+		if err := imageSender.SendImage(e.ctx, target.replyCtx, img); err != nil {
+			return err
+		}
+	}
+	for _, file := range files {
+		if err := e.waitOutgoing(target.platform); err != nil {
+			return err
+		}
+		if err := fileSender.SendFile(e.ctx, target.replyCtx, file); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *Engine) resolveSendTarget(sessionKey string, attachments bool) (sendTarget, error) {
+	e.interactiveMu.Lock()
+
+	resolvedSessionKey := sessionKey
+	var state *interactiveState
+	if sessionKey != "" {
+		state = e.interactiveStates[sessionKey]
+		if state == nil && e.multiWorkspace {
+			if iKey := e.interactiveKeyForSessionKeyLocked(sessionKey); iKey != sessionKey {
+				state = e.interactiveStates[iKey]
+			}
+		}
+	} else if len(e.interactiveStates) == 1 {
+		for key, s := range e.interactiveStates {
+			resolvedSessionKey = key
+			state = s
+			break
+		}
+	} else if len(e.interactiveStates) > 1 && attachments {
+		e.interactiveMu.Unlock()
+		return sendTarget{}, fmt.Errorf("multiple active sessions; must specify --session to send attachments")
+	} else {
+		for key, s := range e.interactiveStates {
+			resolvedSessionKey = key
+			state = s
+			break
+		}
+	}
+	e.interactiveMu.Unlock()
+
+	var p Platform
+	var replyCtx any
+	if state != nil {
+		state.mu.Lock()
+		p = state.platform
+		replyCtx = state.replyCtx
+		state.mu.Unlock()
+	}
+
+	if p == nil && resolvedSessionKey != "" {
+		strippedKey := resolvedSessionKey
+		platformName := ""
+		if idx := strings.Index(strippedKey, ":"); idx > 0 {
+			platformName = strippedKey[:idx]
+		}
+		var targetPlatform Platform
+		for _, candidate := range e.platforms {
+			if candidate.Name() == platformName {
+				targetPlatform = candidate
+				break
+			}
+		}
+		if targetPlatform == nil {
+			for _, candidate := range e.platforms {
+				needle := ":" + candidate.Name() + ":"
+				if idx := strings.Index(strippedKey, needle); idx >= 0 {
+					targetPlatform = candidate
+					strippedKey = strippedKey[idx+1:]
+					break
+				}
+			}
+		}
+		if targetPlatform != nil {
+			rc, ok := targetPlatform.(ReplyContextReconstructor)
+			if !ok {
+				return sendTarget{}, fmt.Errorf("platform %q does not support proactive messaging", targetPlatform.Name())
+			}
+			reconstructed, err := rc.ReconstructReplyCtx(strippedKey)
+			if err != nil {
+				return sendTarget{}, fmt.Errorf("reconstruct reply context: %w", err)
+			}
+			p = targetPlatform
+			replyCtx = reconstructed
+			resolvedSessionKey = strippedKey
+		}
+	}
+
+	return sendTarget{
+		state:      state,
+		platform:   p,
+		replyCtx:   replyCtx,
+		sessionKey: resolvedSessionKey,
+	}, nil
+}
+
+func (e *Engine) resolveSendWorkDir(workDir string) (string, bool, error) {
+	current := e.currentSendWorkDir()
+	target, err := normalizeSendWorkDir(workDir, current)
+	if err != nil {
+		return "", false, err
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		return "", false, fmt.Errorf("work_dir %q: %w", target, err)
+	}
+	if !info.IsDir() {
+		return "", false, fmt.Errorf("work_dir %q is not a directory", target)
+	}
+
+	if current != "" {
+		if normalizedCurrent, err := normalizeSendWorkDir(current, ""); err == nil && normalizedCurrent == target {
+			return target, false, nil
+		}
+	}
+	return target, true, nil
+}
+
+func (e *Engine) currentSendWorkDir() string {
+	if e.agent != nil {
+		if wd, ok := e.agent.(interface{ GetWorkDir() string }); ok {
+			if dir := strings.TrimSpace(wd.GetWorkDir()); dir != "" {
+				return dir
+			}
+		}
+	}
+	if strings.TrimSpace(e.baseWorkDir) != "" {
+		return strings.TrimSpace(e.baseWorkDir)
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		return cwd
+	}
+	return ""
+}
+
+func normalizeSendWorkDir(workDir, base string) (string, error) {
+	dir := strings.TrimSpace(workDir)
+	if dir == "" {
+		return "", fmt.Errorf("work_dir is required")
+	}
+	if dir == "~" || strings.HasPrefix(dir, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve home directory: %w", err)
+		}
+		if dir == "~" {
+			dir = home
+		} else {
+			dir = filepath.Join(home, strings.TrimPrefix(dir, "~/"))
+		}
+	}
+	if !filepath.IsAbs(dir) {
+		if strings.TrimSpace(base) == "" {
+			var err error
+			base, err = os.Getwd()
+			if err != nil {
+				return "", fmt.Errorf("resolve current directory: %w", err)
+			}
+		}
+		dir = filepath.Join(base, dir)
+	}
+	abs, err := filepath.Abs(filepath.Clean(dir))
+	if err != nil {
+		return "", err
+	}
+	return abs, nil
 }
 
 // SendTTSToSession synthesizes and sends a voice message to an active session.
@@ -15460,6 +15749,11 @@ func (e *Engine) commandContextWithWorkspace(p Platform, msg *Message) (Agent, *
 // sessionContextForKey resolves the agent and session manager for a sessionKey.
 // It uses existing workspace bindings and falls back to global context if unresolved.
 func (e *Engine) sessionContextForKey(sessionKey string) (Agent, *SessionManager) {
+	if workspace := e.sendWorkDirForSession(sessionKey); workspace != "" {
+		if wsAgent, wsSessions, err := e.getOrCreateWorkspaceAgent(workspace); err == nil {
+			return wsAgent, wsSessions
+		}
+	}
 	if !e.multiWorkspace || e.workspaceBindings == nil {
 		return e.agent, e.sessions
 	}
@@ -15485,6 +15779,54 @@ func (e *Engine) sessionContextForKey(sessionKey string) (Agent, *SessionManager
 	return e.agent, e.sessions
 }
 
+func (e *Engine) bindSendWorkDir(sessionKey, workDir string) {
+	if sessionKey == "" || workDir == "" {
+		return
+	}
+	keys := []string{sessionKey}
+	if participantKey := directParticipantKeyForSession(sessionKey); participantKey != "" {
+		keys = append(keys, participantKey)
+	}
+	e.sendWorkDirMu.Lock()
+	defer e.sendWorkDirMu.Unlock()
+	if e.sendWorkDirs == nil {
+		e.sendWorkDirs = make(map[string]string)
+	}
+	for _, key := range keys {
+		if key != "" {
+			e.sendWorkDirs[key] = workDir
+		}
+	}
+}
+
+func (e *Engine) sendWorkDirForSession(sessionKey string) string {
+	if sessionKey == "" {
+		return ""
+	}
+	participantKey := directParticipantKeyForSession(sessionKey)
+	e.sendWorkDirMu.RLock()
+	defer e.sendWorkDirMu.RUnlock()
+	if workDir := e.sendWorkDirs[sessionKey]; workDir != "" {
+		return workDir
+	}
+	if participantKey != "" {
+		return e.sendWorkDirs[participantKey]
+	}
+	return ""
+}
+
+func directParticipantKeyForSession(sessionKey string) string {
+	platformName := extractPlatformName(sessionKey)
+	if platformName == "" {
+		return ""
+	}
+	parts := strings.SplitN(sessionKey, ":", 5)
+	if len(parts) < 4 || parts[1] != "d" || strings.TrimSpace(parts[3]) == "" {
+		return ""
+	}
+	return platformName + ":direct-user:" + strings.TrimSpace(parts[3])
+}
+
 // workspaceFromLiveState extracts the workspace path embedded in a live
 // interactive state key for sessionKey, or "" if no live state references
 // this sessionKey. Used as a recovery path when channel-binding-derived
@@ -15507,6 +15849,9 @@ func (e *Engine) workspaceFromLiveState(sessionKey string) string {
 // interactiveKeyForSessionKey returns the interactive state key for a sessionKey.
 // In multi-workspace mode, it prefixes with the bound workspace path when available.
 func (e *Engine) interactiveKeyForSessionKey(sessionKey string) string {
+	if workspace := e.sendWorkDirForSession(sessionKey); workspace != "" {
+		return workspace + ":" + sessionKey
+	}
 	// Single-workspace fast path: no scan, no binding lookup, no lock.
 	if !e.multiWorkspace || e.workspaceBindings == nil {
 		return sessionKey
@@ -15540,6 +15885,9 @@ func (e *Engine) interactiveKeyForSessionKey(sessionKey string) string {
 //     ID, so step 2 misses. The state map was keyed correctly at processing
 //     time, so we recover the workspace prefix from there.
 func (e *Engine) interactiveKeyForSessionKeyLocked(sessionKey string) string {
+	if workspace := e.sendWorkDirForSession(sessionKey); workspace != "" {
+		return workspace + ":" + sessionKey
+	}
 	if !e.multiWorkspace || e.workspaceBindings == nil {
 		return sessionKey
 	}
