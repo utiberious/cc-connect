@@ -1,5 +1,27 @@
 # Changelog
 
+## v1.4.0-beta.2 (2026-06-23)
+
+Rolling beta with 10 additional commits on top of beta.1: 3 QA-found hotfixes + 7 cherry-picked PRs from main. QA has verified all changes.
+
+See `changelogs/v1.4.0-beta.2.md` for the full themed summary with credits.
+
+### Features
+- **codex model_catalog_json**: prefer Codex's own `model_catalog_json` as highest-priority model source (#1074, @happyTonakai).
+- **`cc-connect send --cwd`**: specify the working directory for send commands (#1380, @MMMarcinho).
+
+### Refactor
+- **agent option parsing**: centralize cmd/env option parsing into core with a unified `cmd` field. Touches 39 files across all agent adapters (#1297, @happyTonakai). ⚠️ Broad refactor — monitor agent startup compatibility with existing configs.
+
+### Fixed
+- **feishu image batch window**: make `imageBatchWindow` configurable; bump default from 150 ms → 500 ms to better handle mobile multi-image bursts (QA hotfix, @qa-cursor).
+- **i18n nav.cron**: translate `nav.cron` for Korean, Japanese, Spanish — was leaking raw "Cron" string (QA hotfix, @qa-cursor).
+- **slack streaming card**: stop `chat.update` once payload exceeds Slack's size limit; deliver full reply via fresh `postMessage` instead of crashing with `msg_too_long` (QA hotfix, @qa-cursor).
+- **core /history truncation**: make `/history` entry truncation length configurable (#1291, @AaronZ345).
+- **core post-restart notification**: queue post-restart notification and dispatch on platform ready (#1388, @chenhg5).
+- **claudecode progress card**: emit `EventToolResult` so tool output reaches the progress card (#1407, @coolrockin).
+- **dingtalk stream panic**: recover panic in DingTalk `StreamClient` `processLoop` to prevent process crash on closed channel (#1390, fix for issue reported by @gd0094).
+
 ## v1.4.0-beta.1 (2026-06-22)
 
 First beta of the v1.4.0 series. **Two new platforms join the family** (Cisco Webex, Matrix with E2EE) plus broader configurability for claudecode/codex, Korean i18n, and a batch of fixes carried forward from late v1.3 development.
