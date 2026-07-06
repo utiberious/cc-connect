@@ -4351,9 +4351,10 @@ const defaultEventIdleTimeout = 2 * time.Hour
 
 // cardToolEntry stores a tool call record for card content rendering.
 type cardToolEntry struct {
-	Index int
-	Name  string
-	Input string
+	Index  int
+	Name   string
+	Input  string
+	Result string // filled by EventToolResult so the streaming card can render `↳ …` under each tool row
 }
 
 // buildCardContent constructs the full markdown for the streaming card.
@@ -4368,6 +4369,11 @@ func buildCardContent(thinking string, tools []cardToolEntry, answer string) str
 		sb.WriteString(fmt.Sprintf("🔧 **Tool #%d**: `%s`\n", t.Index, t.Name))
 		if t.Input != "" {
 			sb.WriteString(t.Input)
+			sb.WriteString("\n")
+		}
+		if t.Result != "" {
+			sb.WriteString("↳ ")
+			sb.WriteString(t.Result)
 			sb.WriteString("\n")
 		}
 		sb.WriteString("\n")
@@ -5163,6 +5169,27 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					result = truncateIf(result, e.display.ToolMaxLen)
 				}
 				if result != "" || event.ToolStatus != "" || event.ToolExitCode != nil || event.ToolSuccess != nil {
+					// --- StreamingCard path (added on utiberious fork) ---
+					// Route the tool result back into the streaming card so
+					// platforms like Zulip see one edited message instead of
+					// receiving each result as a standalone send.
+					if streamCard != nil && !streamCard.Failed() {
+						// Attach the result to the first unresolved tool row
+						// with a matching name so out-of-order results still
+						// land on the correct card entry when a turn issues
+						// several `bash` calls in a row.
+						for i := range cardToolCalls {
+							if cardToolCalls[i].Result != "" {
+								continue
+							}
+							if cardToolCalls[i].Name == event.ToolName || event.ToolName == "" {
+								cardToolCalls[i].Result = result
+								break
+							}
+						}
+						_ = streamCard.Update(e.ctx, buildCardContent(cardThinkingText, cardToolCalls, cardAnswerText.String()))
+						break
+					}
 					if hasRichCard {
 						toolSteps = mergeRichToolResult(toolSteps, event, result, e.display.ToolMaxLen)
 						if cardMessageID == nil {
