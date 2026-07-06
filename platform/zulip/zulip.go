@@ -34,6 +34,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -731,6 +732,97 @@ func (p *Platform) DeletePreviewMessage(ctx context.Context, handle any) error {
 	}
 	return p.apiCall(ctx, http.MethodDelete,
 		"/messages/"+strconv.FormatInt(h.messageID, 10), nil, nil)
+}
+
+// ── StreamingCardPlatform ────────────────────────────────────────────────────
+//
+// Zulip natively supports message edits (PATCH /messages/{id}) with no
+// per-edit visual noise beyond a small "(edited)" marker, so the engine's
+// StreamingCard path (see core/engine.go around EventText/EventThinking/
+// EventToolUse) works cleanly for us: one initial POST + N PATCHes as
+// thinking / tool progress / tool results / answer accumulate into a single
+// message body. This is what lets tool-using pi/codex turns render as a
+// single edited card instead of splitting into thinking + N tools + N
+// results + final answer.
+//
+// The engine builds the card content string via its own composer and calls
+// Update() with the full body each time — implementations do NOT compose;
+// they only render the final markdown into a Zulip message.
+
+// zulipStreamingCard implements core.StreamingCard by editing a single Zulip
+// message in place as the engine accumulates content over the turn.
+type zulipStreamingCard struct {
+	platform    *Platform
+	replyCtx    replyContext
+	mu          sync.Mutex
+	messageID   int64  // 0 until first Update() posts the initial message
+	lastContent string // dedup: skip PATCHes that would send identical content
+	failed      bool
+}
+
+func (c *zulipStreamingCard) sendInitial(ctx context.Context, content string) (int64, error) {
+	switch c.replyCtx.kind {
+	case "stream":
+		return c.platform.sendStreamMessage(ctx, c.replyCtx.stream, c.replyCtx.topic, content)
+	case "private":
+		return c.platform.sendPrivateMessage(ctx, c.replyCtx.dmTo, content)
+	default:
+		return 0, fmt.Errorf("zulip streaming card: unknown replyCtx kind %q", c.replyCtx.kind)
+	}
+}
+
+// Update replaces the card body with `content`. First call POSTs a new
+// message; subsequent calls PATCH it.
+func (c *zulipStreamingCard) Update(ctx context.Context, content string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.failed {
+		return errors.New("zulip streaming card: previously failed")
+	}
+	if content == "" || content == c.lastContent {
+		return nil
+	}
+	if c.messageID == 0 {
+		id, err := c.sendInitial(ctx, content)
+		if err != nil {
+			c.failed = true
+			return err
+		}
+		c.messageID = id
+	} else {
+		if err := c.platform.editMessage(ctx, c.messageID, content); err != nil {
+			c.failed = true
+			return err
+		}
+	}
+	c.lastContent = content
+	return nil
+}
+
+// Finalize renders the final content. Zulip has no separate "final" concept,
+// so this is just a last Update.
+func (c *zulipStreamingCard) Finalize(ctx context.Context, content string) error {
+	return c.Update(ctx, content)
+}
+
+// Failed reports whether an earlier Update returned an error; the engine
+// uses this to decide whether to fall back to sending individual messages.
+func (c *zulipStreamingCard) Failed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.failed
+}
+
+// CreateStreamingCard makes Zulip implement core.StreamingCardPlatform.
+// The engine calls this at the start of each turn so that thinking, tool
+// progress, and answer text can all be folded into one edited message
+// instead of a series of separate posts.
+func (p *Platform) CreateStreamingCard(ctx context.Context, replyCtx any) (core.StreamingCard, error) {
+	rc, ok := replyCtx.(replyContext)
+	if !ok {
+		return nil, fmt.Errorf("zulip: invalid reply context type %T", replyCtx)
+	}
+	return &zulipStreamingCard{platform: p, replyCtx: rc}, nil
 }
 
 // ── Session reconstruction (for cron) ────────────────────────────────────────
