@@ -71,6 +71,12 @@ type piSession struct {
 
 	thinkingBuf   strings.Builder
 	thinkingMu    sync.Mutex
+	// pendingThinking queues completed thinking blocks that will be emitted
+	// as EventThinking ONLY if a tool call follows in the same turn (mirrors
+	// codex's flushPendingAsThinking pattern in agent/codex/session.go:439).
+	// Turns without tool calls drop these events entirely so the reply is a
+	// single clean card instead of a 3+-message split. Protected by thinkingMu.
+	pendingThinking []string
 	modelsCW      map[string]int // cached from ~/.pi/agent/models.json
 	usageMu    sync.Mutex
 	lastUsage  *core.ContextUsage
@@ -317,6 +323,11 @@ func (s *piSession) Send(msg string, images []core.ImageAttachment, files []core
 	if !s.alive.Load() {
 		return fmt.Errorf("session is closed")
 	}
+
+	// Drop any pending thinking left over from the previous turn — a turn
+	// that ended with buffered thinking (no tool call) must not leak that
+	// text into the next turn's tool boundary.
+	s.resetPendingThinking()
 
 	cleanAttachments(s.attachDir)
 
@@ -797,17 +808,50 @@ func (s *piSession) handleMessageUpdate(raw map[string]any) {
 			s.thinkingMu.Unlock()
 			return
 		}
-		evt := core.Event{Type: core.EventThinking, Content: s.thinkingBuf.String()}
+		// Buffer this thinking block; only flush as EventThinking if a tool
+		// call follows this turn (codex-style; keeps simple replies
+		// single-message instead of splitting into thinking + answer).
+		s.pendingThinking = append(s.pendingThinking, s.thinkingBuf.String())
 		s.thinkingBuf.Reset()
 		s.thinkingMu.Unlock()
-		select {
-		case s.events <- evt:
-		case <-s.ctx.Done():
-		}
 
 	case "toolcall_end":
+		s.flushPendingThinkingLocked()
 		s.emitToolFromMessage(msg)
 	}
+}
+
+// flushPendingThinkingLocked emits any buffered thinking blocks as EventThinking
+// before a tool-call event, matching the codex agent's flushPendingAsThinking
+// pattern (agent/codex/session.go:439). Callers must NOT hold s.thinkingMu.
+func (s *piSession) flushPendingThinkingLocked() {
+	s.thinkingMu.Lock()
+	if len(s.pendingThinking) == 0 {
+		s.thinkingMu.Unlock()
+		return
+	}
+	blocks := s.pendingThinking
+	s.pendingThinking = nil
+	s.thinkingMu.Unlock()
+	for _, text := range blocks {
+		if s.ctx.Err() != nil {
+			return
+		}
+		select {
+		case s.events <- core.Event{Type: core.EventThinking, Content: text}:
+		case <-s.ctx.Done():
+			return
+		}
+	}
+}
+
+// resetPendingThinking drops any leftover buffered thinking from a prior turn
+// so it can't accidentally leak into the next turn's tool boundary.
+func (s *piSession) resetPendingThinking() {
+	s.thinkingMu.Lock()
+	s.pendingThinking = nil
+	s.thinkingBuf.Reset()
+	s.thinkingMu.Unlock()
 }
 
 func (s *piSession) emitToolFromMessage(ame map[string]any) {
