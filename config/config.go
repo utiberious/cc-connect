@@ -188,6 +188,7 @@ const (
 	DisplayModeFull    = "full"    // show thinking + tool messages as separate messages (default)
 	DisplayModeCompact = "compact" // hide thinking/tool, each text segment is a separate card
 	DisplayModeQuiet   = "quiet"   // hide thinking/tool, all text appends to one card
+	DisplayModeInline  = "inline"  // fold thinking into the same streaming card as the answer (no split)
 )
 
 // DisplayConfig controls how intermediate messages (thinking, tool output) are shown.
@@ -1078,9 +1079,9 @@ func validateDisplayConfig(prefix string, display *DisplayConfig) error {
 	}
 	if display.Mode != nil {
 		switch *display.Mode {
-		case DisplayModeFull, DisplayModeCompact, DisplayModeQuiet:
+		case DisplayModeFull, DisplayModeCompact, DisplayModeQuiet, DisplayModeInline:
 		default:
-			return fmt.Errorf("config: %s.mode must be \"full\", \"compact\", or \"quiet\"", prefix)
+			return fmt.Errorf("config: %s.mode must be \"full\", \"compact\", \"quiet\", or \"inline\"", prefix)
 		}
 	}
 	if display.CardMode != nil {

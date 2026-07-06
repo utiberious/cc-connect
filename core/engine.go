@@ -4952,6 +4952,24 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 				break
 			}
+			// Inline mode: fold thinking into the same streaming card as the answer
+			// via streamPreview. Do NOT freeze/detach; do NOT send a separate
+			// message. Append a formatted marker to both textParts (so the final
+			// fullResponse assembled at EventResult contains it) and to
+			// streamPreview (so the live preview shows the thinking immediately).
+			// This is the pi-shows-a-card-like-codex path (thread 1504…).
+			if e.display.Mode == "inline" && e.display.ThinkingMessages && event.Content != "" {
+				preview := truncateIf(event.Content, e.display.ThinkingMaxLen)
+				trimmed := strings.TrimSpace(preview)
+				if trimmed != "" {
+					marker := fmt.Sprintf("_💭 %s_\n\n", trimmed)
+					textParts = append(textParts, marker)
+					if sp.canPreview() {
+						sp.appendText(marker)
+					}
+				}
+				break
+			}
 			// When thinking messages are hidden, behavior depends on display mode:
 			//   quiet:   append separator to keep all text in one card
 			//   compact: freeze+detach to split text into separate cards
