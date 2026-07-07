@@ -62,6 +62,16 @@ MiniMax-M3 pushes the frontier of coding and agentic AI, with a 1M-token context
 </tr>
 
 <tr>
+<td width="150"><a href="https://s.qiniu.com/aUbueu"><img src="assets/sponsors/qiniu.png" alt="七牛云 Qiniu Cloud" width="120"></a></td>
+<td>Thanks to <a href="https://s.qiniu.com/aUbueu">Qiniu Cloud AI</a> for sponsoring this project! Qiniu Cloud (HK:02567) is an enterprise-grade LLM MaaS platform offering one-stop access to 150+ leading global models with full protocol compatibility across all major providers. It covers text, image, audio, video, and file processing across all modalities, serving over 1.69 million enterprise and developer users worldwide. Exclusive offer for cc-connect users: enterprise customers get 12 million free tokens, and refer friends to earn up to billions of tokens in bonus.</td>
+</tr>
+
+<tr>
+<td width="150"><a href="https://api.fenno.ai/register?redirect=/purchase?tab=subscription%26group=16&aff=C7KG6WBS7CQJ"><img src="assets/sponsors/fenno.png" alt="Fenno.ai" width="120"></a></td>
+<td>Thanks to Fenno.ai for sponsoring this project! Fenno.ai is a stable, efficient API relay service currently providing Codex relay with full OpenAI and Anthropic protocol compatibility. It flexibly integrates with mainstream coding tools like Codex, Claude Code, and OpenCode, reliably supporting enterprise-level demands of hundreds of billions of tokens per day. Fenno.ai supports domestic and overseas entity-to-entity settlement and invoicing. Exclusive offer for cc-connect users: subscribe via <a href="https://api.fenno.ai/register?redirect=/purchase?tab=subscription%26group=16&aff=C7KG6WBS7CQJ">this link</a> for an unbeatable Coding Plan at ¥9.9 / $150 credit, and earn up to 20% bonus for each friend you refer.</td>
+</tr>
+
+<tr>
 <td width="150"><a href="https://aigocode.com/invite/CYY3C85C"><img src="assets/sponsors/aigocode.png" alt="AIGoCode" width="120"></a></td>
 <td>Thanks to AIGoCode for sponsoring this project! AIGoCode is an all-in-one platform that integrates Claude Code, Codex, and the latest Gemini models, providing you with stable, efficient, and highly cost-effective AI coding services. The platform offers flexible subscription plans, zero risk of account suspension, direct access with no VPN required, and lightning-fast responses. AIGoCode has prepared a special benefit for cc-connect users: if you register via <a href="https://aigocode.com/invite/CYY3C85C">this link</a>, you'll receive an extra 10% bonus credit on your first top-up!</td>
 </tr>
