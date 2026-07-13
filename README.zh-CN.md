@@ -47,11 +47,13 @@
 <details open>
 <summary>赞助商</summary>
 
-[![MiniMax](assets/banners/minimax-zh.png)](https://platform.minimaxi.com/subscribe/token-plan?code=HAvthxk1tT&source=link)
+[![Kimi](assets/sponsors/kimi-banner-zh.png)](https://www.kimi.com/code/?aff=cc-connect)
 
-MiniMax M3 突破 Coding 与 Agentic AI 前沿，基于 MiniMax Sparse Attention 支持 1M 超长上下文，并从零原生支持多模态。在 SWE-Bench Pro (59.0)、Terminal Bench 2.1 (66.0)、VIBE V2 (60.1)、SVG-Bench (63.7)、KernelBench Hard (28.8)、BrowseComp (83.5)、GDPval rubrics (74.7)、Banker ToolBench (76.1)、MCP Atlas (74.2)、OSWorld-verified (70.0) 等多项基准中领先业界。Mini 价格 Max 性能，Token Plan 助你 Build / Learn / Ship。
+感谢 [Kimi](https://www.kimi.com/code/?aff=cc-connect) 赞助本项目！[Kimi K2.7 Code](https://platform.kimi.com/docs/guide/kimi-k2-7-code-quickstart) 是 Moonshot AI 推出的编程专用开源智能体模型，在真实长程编程与复杂软件工程工作流中显著提升端到端任务成功率，同时优化推理效率，相比 K2.6 平均减少约 30% 的推理 Token 消耗。
 
-[点击此处](https://platform.minimaxi.com/subscribe/token-plan?code=HAvthxk1tT&source=link)享 MiniMax Token Plan 专属 88 折优惠 + cc-connect 用户专属代金券！
+在 cc-connect 中，你可以直接接入 Kimi CLI，将运行在本地电脑上的 Kimi 连接到飞书、钉钉、Telegram、Slack、Discord、企业微信等即时通讯工具。无论身在何处，都能通过消息继续处理本地项目，让 Kimi 协助阅读和修改代码、排查问题、执行命令与自动化任务。
+
+cc-connect 已支持 Kimi CLI。立即体验高性价比的 [Kimi Code 订阅](https://www.kimi.com/code/?aff=cc-connect)，或前往 Kimi 开放平台（[中文站](https://platform.kimi.com/?aff=cc-connect)｜[Global](https://platform.kimi.ai/?aff=cc-connect)）使用 API。
 
 ---
 
