@@ -316,6 +316,7 @@ const (
 	MsgSteerSendFailed      MsgKey = "steer_send_failed"
 	MsgSteerEmpty           MsgKey = "steer_empty"
 	MsgSteerNotSupported    MsgKey = "steer_not_supported"
+	MsgSessionRecovered     MsgKey = "session_recovered"
 
 	MsgMemoryNotSupported MsgKey = "memory_not_supported"
 	MsgMemoryShowProject  MsgKey = "memory_show_project"
@@ -2407,6 +2408,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "❌ 當前 Agent 不支援 `/steer`。",
 		LangJapanese:           "❌ このエージェントは `/steer` をサポートしていません。",
 		LangSpanish:            "❌ Este agente no admite `/steer`.",
+	},
+	MsgSessionRecovered: {
+		LangEnglish:            "⚠️ The agent session became unusable and was replaced. Earlier conversation context may be incomplete.",
+		LangChinese:            "⚠️ Agent 会话已失效并被替换，之前的对话上下文可能不完整。",
+		LangTraditionalChinese: "⚠️ Agent 工作階段已失效並被替換，先前的對話上下文可能不完整。",
+		LangJapanese:           "⚠️ エージェントセッションが使用不能になったため置き換えました。以前の会話コンテキストが不完全な可能性があります。",
+		LangSpanish:            "⚠️ La sesión del agente dejó de ser utilizable y fue reemplazada. El contexto anterior puede estar incompleto.",
 	},
 
 	// Inline strings for engine.go commands
