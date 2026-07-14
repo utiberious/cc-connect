@@ -271,6 +271,19 @@ type TypingIndicatorDone interface {
 	AddDoneReaction(replyCtx any)
 }
 
+type MessageAckKind string
+
+const (
+	MessageAckSteered MessageAckKind = "steered"
+	MessageAckQueued  MessageAckKind = "queued"
+)
+
+// MessageAcknowledger lets a platform replace routine acknowledgement text
+// with a native reaction. False preserves the engine's localized text fallback.
+type MessageAcknowledger interface {
+	AcknowledgeMessage(replyCtx any, kind MessageAckKind) bool
+}
+
 // AtMentionSender is an optional interface for platforms that support @mention in
 // reply messages (e.g. DingTalk). Platforms that implement this interface can
 // include @user notifications when replying in group chats.

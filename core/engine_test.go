@@ -67,6 +67,17 @@ type stubPlatformEngine struct {
 	mu   sync.Mutex
 }
 
+type stubAcknowledgingPlatform struct {
+	stubPlatformEngine
+	handled bool
+	acks    []MessageAckKind
+}
+
+func (p *stubAcknowledgingPlatform) AcknowledgeMessage(_ any, kind MessageAckKind) bool {
+	p.acks = append(p.acks, kind)
+	return p.handled
+}
+
 type observingPlatform struct {
 	stubPlatformEngine
 	observe func(string)
@@ -9716,6 +9727,29 @@ func TestExecuteCardAction_ModeCleansUpWithInteractiveKey(t *testing.T) {
 
 // --- 1. Message queue overflow ---
 
+func TestQueueMessageForBusySession_UsesPlatformAcknowledgement(t *testing.T) {
+	p := &stubAcknowledgingPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "test"},
+		handled:            true,
+	}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	key := "test:queued-ack"
+	state := &interactiveState{agentSession: &stubAgentSession{}, platform: p, replyCtx: "ctx"}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	if !e.queueMessageForBusySession(p, &Message{SessionKey: key, Content: "next", ReplyCtx: "ctx"}, key) {
+		t.Fatal("message was not queued")
+	}
+	if len(p.acks) != 1 || p.acks[0] != MessageAckQueued {
+		t.Fatalf("acknowledgements = %#v, want queued reaction", p.acks)
+	}
+	if sent := p.getSent(); len(sent) != 0 {
+		t.Fatalf("text replies = %#v, want reaction only", sent)
+	}
+}
+
 func TestQueueMessageOverflow_DropsOldestAndReturnsfalse(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	sess := newQueuingSession("qs-overflow")
@@ -10943,6 +10977,58 @@ func TestCmdSteer_Success_SendsGuidance(t *testing.T) {
 	}
 	if !strings.Contains(sent[0], e.i18n.T(MsgSteerSent)) {
 		t.Fatalf("expected MsgSteerSent, got %q", sent[0])
+	}
+}
+
+func TestCmdSteer_Success_UsesPlatformAcknowledgement(t *testing.T) {
+	p := &stubAcknowledgingPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "test"},
+		handled:            true,
+	}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	key := "test:user1"
+	sess := &steerSession{}
+	session := e.sessions.GetOrCreateActive(key)
+	if !session.TryLock() {
+		t.Fatal("failed to mark session busy")
+	}
+	defer session.Unlock()
+
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = &interactiveState{agentSession: sess}
+	e.interactiveMu.Unlock()
+
+	msg := &Message{SessionKey: key, Content: "/steer focus", ReplyCtx: "ctx"}
+	if !e.cmdSteer(p, msg, []string{"focus"}) {
+		t.Fatal("busy steer should be handled")
+	}
+	if len(p.acks) != 1 || p.acks[0] != MessageAckSteered {
+		t.Fatalf("acknowledgements = %#v, want steer reaction", p.acks)
+	}
+	if sent := p.getSent(); len(sent) != 0 {
+		t.Fatalf("text replies = %#v, want reaction only", sent)
+	}
+}
+
+func TestCmdSteer_AcknowledgementFailureFallsBackToText(t *testing.T) {
+	p := &stubAcknowledgingPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	key := "test:user1"
+	session := e.sessions.GetOrCreateActive(key)
+	if !session.TryLock() {
+		t.Fatal("failed to mark session busy")
+	}
+	defer session.Unlock()
+
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = &interactiveState{agentSession: &steerSession{}}
+	e.interactiveMu.Unlock()
+
+	if !e.cmdSteer(p, &Message{SessionKey: key, ReplyCtx: "ctx"}, []string{"focus"}) {
+		t.Fatal("busy steer should be handled")
+	}
+	if sent := p.getSent(); len(sent) != 1 || !strings.Contains(sent[0], e.i18n.T(MsgSteerSent)) {
+		t.Fatalf("text replies = %#v, want fallback acknowledgement", sent)
 	}
 }
 

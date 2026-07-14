@@ -3143,8 +3143,15 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		"user", msg.UserName,
 		"queue_depth", queueDepth,
 	)
-	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMessageQueued))
+	e.acknowledgeOrReply(p, msg, MessageAckQueued, MsgMessageQueued)
 	return true
+}
+
+func (e *Engine) acknowledgeOrReply(p Platform, msg *Message, kind MessageAckKind, fallback MsgKey) {
+	if acknowledger, ok := p.(MessageAcknowledger); ok && acknowledger.AcknowledgeMessage(msg.ReplyCtx, kind) {
+		return
+	}
+	e.reply(p, msg.ReplyCtx, e.i18n.T(fallback))
 }
 
 // ensureInteractiveStateForQueueing creates a placeholder interactiveState
@@ -10098,7 +10105,7 @@ func (e *Engine) cmdSteer(p Platform, msg *Message, args []string) bool {
 		return true
 	}
 
-	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSteerSent))
+	e.acknowledgeOrReply(p, msg, MessageAckSteered, MsgSteerSent)
 	return true
 }
 

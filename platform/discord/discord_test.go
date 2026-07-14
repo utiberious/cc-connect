@@ -649,6 +649,53 @@ func TestNew_ProgressStyleRejectsInvalidValue(t *testing.T) {
 	}
 }
 
+func TestNew_ConfiguresAcknowledgementStyle(t *testing.T) {
+	pAny, err := New(map[string]any{
+		"token":           "discord-token",
+		"ack_style":       "reaction",
+		"steer_ack_emoji": "🧭",
+		"queue_ack_emoji": "⏳",
+		"progress_style":  "card",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	p := basePlatformFor(t, pAny)
+	if p.ackStyle != "reaction" || p.steerAckEmoji != "🧭" || p.queueAckEmoji != "⏳" {
+		t.Fatalf("ack config = (%q, %q, %q)", p.ackStyle, p.steerAckEmoji, p.queueAckEmoji)
+	}
+}
+
+func TestNew_RejectsInvalidAcknowledgementStyle(t *testing.T) {
+	_, err := New(map[string]any{"token": "discord-token", "ack_style": "embed"})
+	if err == nil || !strings.Contains(err.Error(), "invalid ack_style") {
+		t.Fatalf("New() error = %v, want invalid ack_style", err)
+	}
+}
+
+func TestAcknowledgeMessage_AddsConfiguredReaction(t *testing.T) {
+	var method, path string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method = r.Method
+		path = r.URL.Path
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	p := &Platform{
+		ackStyle:      "reaction",
+		steerAckEmoji: "🧭",
+		queueAckEmoji: "⏳",
+		session:       newTestDiscordSession(t, server),
+	}
+	if !p.AcknowledgeMessage(replyContext{channelID: "channel-1", messageID: "message-1"}, core.MessageAckSteered) {
+		t.Fatal("AcknowledgeMessage() = false, want reaction handled")
+	}
+	if method != http.MethodPut || !strings.Contains(path, "/channels/channel-1/messages/message-1/reactions/🧭/@me") {
+		t.Fatalf("reaction request = %s %q", method, path)
+	}
+}
+
 func TestNew_LegacyProgressStyleDoesNotEnableProgressInterfaces(t *testing.T) {
 	pAny, err := New(map[string]any{
 		"token":          "discord-token",

@@ -53,6 +53,9 @@ type Platform struct {
 	shareSessionInChannel      bool
 	threadIsolation            bool
 	respondToAtEveryoneAndHere bool
+	ackStyle                   string
+	steerAckEmoji              string
+	queueAckEmoji              string
 	proxyURL                   *url.URL
 	handler                    core.MessageHandler
 	botID                      string
@@ -98,6 +101,24 @@ func New(opts map[string]any) (core.Platform, error) {
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 	threadIsolation, _ := opts["thread_isolation"].(bool)
 	respondToAtEveryoneAndHere, _ := opts["respond_to_at_everyone_and_here"].(bool)
+	ackStyle := "message"
+	if v, ok := opts["ack_style"].(string); ok {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "", "message":
+		case "reaction":
+			ackStyle = "reaction"
+		default:
+			return nil, fmt.Errorf("discord: invalid ack_style %q (want message or reaction)", v)
+		}
+	}
+	steerAckEmoji := "🧭"
+	if v, ok := opts["steer_ack_emoji"].(string); ok && strings.TrimSpace(v) != "" {
+		steerAckEmoji = strings.TrimSpace(v)
+	}
+	queueAckEmoji := "⏳"
+	if v, ok := opts["queue_ack_emoji"].(string); ok && strings.TrimSpace(v) != "" {
+		queueAckEmoji = strings.TrimSpace(v)
+	}
 	// Default to "compact" so streaming edits work out of the box (Discord
 	// supports MessageUpdater.UpdateMessage). Users can opt back into the old
 	// "send entire reply at once" behavior with progress_style = "legacy".
@@ -138,6 +159,9 @@ func New(opts map[string]any) (core.Platform, error) {
 		readyCh:                    make(chan struct{}),
 		threadIsolation:            threadIsolation,
 		respondToAtEveryoneAndHere: respondToAtEveryoneAndHere,
+		ackStyle:                   ackStyle,
+		steerAckEmoji:              steerAckEmoji,
+		queueAckEmoji:              queueAckEmoji,
 		proxyURL:                   proxyU,
 	}
 	if progressStyle == "compact" || progressStyle == "card" {
@@ -150,6 +174,50 @@ func New(opts map[string]any) (core.Platform, error) {
 }
 
 func (p *Platform) Name() string { return "discord" }
+
+func (p *Platform) AcknowledgeMessage(replyCtx any, kind core.MessageAckKind) bool {
+	if p.ackStyle != "reaction" {
+		return false
+	}
+
+	var rc replyContext
+	switch v := replyCtx.(type) {
+	case replyContext:
+		rc = v
+	case *replyContext:
+		if v == nil {
+			return false
+		}
+		rc = *v
+	default:
+		return false
+	}
+	if rc.channelID == "" || rc.messageID == "" {
+		return false
+	}
+
+	emoji := ""
+	switch kind {
+	case core.MessageAckSteered:
+		emoji = p.steerAckEmoji
+	case core.MessageAckQueued:
+		emoji = p.queueAckEmoji
+	default:
+		return false
+	}
+
+	p.mu.RLock()
+	session := p.session
+	p.mu.RUnlock()
+	if session == nil {
+		return false
+	}
+	if err := session.MessageReactionAdd(rc.channelID, rc.messageID, emoji); err != nil {
+		slog.Debug("discord: acknowledgement reaction failed", "kind", kind, "emoji", emoji, "error", err)
+		return false
+	}
+	return true
+}
 
 func (p *Platform) selfPlatform() core.Platform {
 	if p != nil && p.self != nil {
