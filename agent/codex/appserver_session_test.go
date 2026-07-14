@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -538,6 +539,47 @@ func TestAppServerSession_StaleParentTurnCompletionDoesNotCompleteActiveTurn(t *
 	}
 }
 
+func TestAppServerSession_FailedTurnCompletionEmitsError(t *testing.T) {
+	s := newAppServerEventTestSession()
+
+	notifyAppServerTest(t, s, "turn/completed", map[string]any{
+		"threadId": "thread-1",
+		"turn": map[string]any{
+			"id":     "turn-1",
+			"status": "failed",
+			"error":  map[string]any{"message": "agent loop died unexpectedly"},
+		},
+	})
+
+	events := drainAppServerTestEvents(s)
+	if len(events) != 1 || events[0].Type != core.EventError {
+		t.Fatalf("events = %#v, want one EventError", events)
+	}
+	if events[0].Error == nil || events[0].Error.Error() != "agent loop died unexpectedly" {
+		t.Fatalf("error = %v, want agent loop failure", events[0].Error)
+	}
+}
+
+func TestAppServerSession_InterruptedTurnCompletionEmitsError(t *testing.T) {
+	s := newAppServerEventTestSession()
+
+	notifyAppServerTest(t, s, "turn/completed", map[string]any{
+		"threadId": "thread-1",
+		"turn": map[string]any{
+			"id":     "turn-1",
+			"status": "interrupted",
+		},
+	})
+
+	events := drainAppServerTestEvents(s)
+	if len(events) != 1 || events[0].Type != core.EventError {
+		t.Fatalf("events = %#v, want one EventError", events)
+	}
+	if events[0].Error == nil || events[0].Error.Error() != "codex turn interrupted" {
+		t.Fatalf("error = %v, want interrupted turn error", events[0].Error)
+	}
+}
+
 func TestAppServerSession_MissingThreadIDDoesNotMutateParentTurn(t *testing.T) {
 	s := newAppServerEventTestSession()
 	s.currentTurn = "parent-turn"
@@ -700,6 +742,199 @@ func TestAppServerSessionSteer_RequestShape(t *testing.T) {
 	}
 }
 
+func TestAppServerSessionSend_RecoversDeadAgentLoopOnFreshThread(t *testing.T) {
+	var s *appServerSession
+	var mu sync.Mutex
+	var requests []map[string]any
+	var turnStarts int
+	stdin := &callbackWriteCloser{onWrite: func(p []byte) {
+		var request map[string]any
+		if err := json.Unmarshal(bytes.TrimSpace(p), &request); err != nil {
+			panic(fmt.Sprintf("decode request: %v", err))
+		}
+		mu.Lock()
+		requests = append(requests, request)
+		method, _ := request["method"].(string)
+		if method == "turn/start" {
+			turnStarts++
+		}
+		currentTurnStart := turnStarts
+		mu.Unlock()
+
+		id := int64(request["id"].(float64))
+		switch {
+		case method == "turn/start" && currentTurnStart == 1:
+			s.handleResponse(rpcResponseEnvelope{ID: id, Error: &rpcError{Message: "failed to start turn: internal error; agent loop died unexpectedly"}})
+		case method == "thread/start":
+			s.handleResponse(rpcResponseEnvelope{ID: id, Result: json.RawMessage(`{"thread":{"id":"thread-new"},"cwd":"/tmp/project","model":"gpt-5.6-sol","reasoningEffort":"high"}`)})
+		case method == "turn/start" && currentTurnStart == 2:
+			s.handleResponse(rpcResponseEnvelope{ID: id, Result: json.RawMessage(`{"turn":{"id":"turn-new"}}`)})
+		default:
+			s.handleResponse(rpcResponseEnvelope{ID: id, Error: &rpcError{Message: "unexpected request"}})
+		}
+	}}
+	s = newScriptedAppServerSession(t, stdin)
+	s.threadID.Store("thread-old")
+	s.promptPreamble = "Project system prompt:\nStay precise."
+	s.preambleSent = true
+
+	if err := s.Send("continue the review", nil, nil); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	if got := s.CurrentSessionID(); got != "thread-new" {
+		t.Fatalf("CurrentSessionID() = %q, want thread-new", got)
+	}
+	if s.currentTurn != "turn-new" {
+		t.Fatalf("currentTurn = %q, want turn-new", s.currentTurn)
+	}
+	if !s.Alive() {
+		t.Fatal("session marked dead after successful recovery")
+	}
+	events := drainAppServerTestEvents(s)
+	if len(events) != 1 || events[0].Type != core.EventSessionRecovered || events[0].SessionID != "thread-new" {
+		t.Fatalf("events = %#v, want fresh-session recovery event", events)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requests) != 3 {
+		t.Fatalf("requests = %d, want 3", len(requests))
+	}
+	wantMethods := []string{"turn/start", "thread/start", "turn/start"}
+	for i, want := range wantMethods {
+		if got := requests[i]["method"]; got != want {
+			t.Fatalf("requests[%d].method = %#v, want %q", i, got, want)
+		}
+	}
+	firstParams := requests[0]["params"].(map[string]any)
+	secondParams := requests[2]["params"].(map[string]any)
+	if firstParams["threadId"] != "thread-old" || secondParams["threadId"] != "thread-new" {
+		t.Fatalf("turn thread IDs = %#v then %#v", firstParams["threadId"], secondParams["threadId"])
+	}
+	firstText := firstParams["input"].([]any)[0].(map[string]any)["text"].(string)
+	secondText := secondParams["input"].([]any)[0].(map[string]any)["text"].(string)
+	if firstText != "continue the review" {
+		t.Fatalf("first prompt = %q, want user message only for resumed thread", firstText)
+	}
+	if !strings.Contains(secondText, "Stay precise.") || !strings.Contains(secondText, "continue the review") {
+		t.Fatalf("recovery prompt = %q, want preamble and original user message", secondText)
+	}
+}
+
+func TestAppServerSessionSend_FailedDeadAgentLoopRecoveryMarksSessionUnhealthy(t *testing.T) {
+	var s *appServerSession
+	stdin := &callbackWriteCloser{onWrite: func(p []byte) {
+		var request map[string]any
+		if err := json.Unmarshal(bytes.TrimSpace(p), &request); err != nil {
+			panic(fmt.Sprintf("decode request: %v", err))
+		}
+		id := int64(request["id"].(float64))
+		method, _ := request["method"].(string)
+		message := "failed to start turn: internal error; agent loop died unexpectedly"
+		if method == "thread/start" {
+			message = "failed to start replacement thread"
+		}
+		s.handleResponse(rpcResponseEnvelope{ID: id, Error: &rpcError{Message: message}})
+	}}
+	s = newScriptedAppServerSession(t, stdin)
+	s.threadID.Store("thread-old")
+
+	err := s.Send("continue the review", nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "fresh thread recovery") {
+		t.Fatalf("Send() error = %v, want fresh thread recovery failure", err)
+	}
+	if s.Alive() {
+		t.Fatal("session remained alive after failed recovery")
+	}
+}
+
+func TestAppServerSessionSend_RetriesDeadAgentLoopOnlyOnce(t *testing.T) {
+	var s *appServerSession
+	var mu sync.Mutex
+	var methods []string
+	stdin := &callbackWriteCloser{onWrite: func(p []byte) {
+		var request map[string]any
+		if err := json.Unmarshal(bytes.TrimSpace(p), &request); err != nil {
+			panic(fmt.Sprintf("decode request: %v", err))
+		}
+		id := int64(request["id"].(float64))
+		method, _ := request["method"].(string)
+		mu.Lock()
+		methods = append(methods, method)
+		mu.Unlock()
+		if method == "thread/start" {
+			s.handleResponse(rpcResponseEnvelope{ID: id, Result: json.RawMessage(`{"thread":{"id":"thread-new"}}`)})
+			return
+		}
+		s.handleResponse(rpcResponseEnvelope{ID: id, Error: &rpcError{Message: "failed to start turn: internal error; agent loop died unexpectedly"}})
+	}}
+	s = newScriptedAppServerSession(t, stdin)
+	s.threadID.Store("thread-old")
+
+	err := s.Send("continue the review", nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "fresh thread recovery retry") {
+		t.Fatalf("Send() error = %v, want retry failure", err)
+	}
+	if s.Alive() {
+		t.Fatal("session remained alive after retry failure")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"turn/start", "thread/start", "turn/start"}
+	if fmt.Sprint(methods) != fmt.Sprint(want) {
+		t.Fatalf("methods = %v, want %v", methods, want)
+	}
+}
+
+func TestAppServerSessionSend_DoesNotRecoverOtherTurnStartErrors(t *testing.T) {
+	var s *appServerSession
+	var mu sync.Mutex
+	var methods []string
+	stdin := &callbackWriteCloser{onWrite: func(p []byte) {
+		var request map[string]any
+		if err := json.Unmarshal(bytes.TrimSpace(p), &request); err != nil {
+			panic(fmt.Sprintf("decode request: %v", err))
+		}
+		id := int64(request["id"].(float64))
+		method, _ := request["method"].(string)
+		mu.Lock()
+		methods = append(methods, method)
+		mu.Unlock()
+		s.handleResponse(rpcResponseEnvelope{ID: id, Error: &rpcError{Message: "rate limit exceeded"}})
+	}}
+	s = newScriptedAppServerSession(t, stdin)
+	s.threadID.Store("thread-old")
+
+	err := s.Send("continue the review", nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "rate limit exceeded") {
+		t.Fatalf("Send() error = %v, want original error", err)
+	}
+	if !s.Alive() {
+		t.Fatal("session marked unhealthy for unrelated turn/start error")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(methods) != 1 || methods[0] != "turn/start" {
+		t.Fatalf("methods = %v, want one turn/start", methods)
+	}
+}
+
+func newScriptedAppServerSession(t *testing.T, stdin io.WriteCloser) *appServerSession {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &appServerSession{
+		workDir:       t.TempDir(),
+		events:        make(chan core.Event, 16),
+		ctx:           ctx,
+		cancel:        cancel,
+		stdin:         stdin,
+		pending:       make(map[int64]chan rpcResponseEnvelope),
+		functionCalls: make(map[string]string),
+	}
+	s.alive.Store(true)
+	return s
+}
+
 var _ interface {
 	GetUsage(context.Context) (*core.UsageReport, error)
 } = (*appServerSession)(nil)
@@ -712,6 +947,21 @@ type lockedWriteCloser struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
 }
+
+type callbackWriteCloser struct {
+	onWrite func([]byte)
+}
+
+func (w *callbackWriteCloser) Write(p []byte) (int, error) {
+	if w.onWrite != nil {
+		w.onWrite(append([]byte(nil), p...))
+	}
+	return len(p), nil
+}
+
+func (w *callbackWriteCloser) Close() error { return nil }
+
+var _ io.WriteCloser = (*callbackWriteCloser)(nil)
 
 func (w *lockedWriteCloser) Write(p []byte) (int, error) {
 	w.mu.Lock()

@@ -463,9 +463,11 @@ func (s *appServerSession) Send(prompt string, images []core.ImageAttachment, fi
 	}
 
 	s.stateMu.Lock()
+	preambleAdded := false
 	if !s.preambleSent {
 		prompt = prependCodexPromptPreamble(prompt, s.promptPreamble)
 		s.preambleSent = true
+		preambleAdded = true
 	}
 	s.stateMu.Unlock()
 
@@ -502,10 +504,35 @@ func (s *appServerSession) Send(prompt string, images []core.ImageAttachment, fi
 	}
 
 	var resp turnStartResponse
+	recovered := false
 	if err := s.request("turn/start", params, &resp); err != nil {
-		return fmt.Errorf("codex app-server turn/start: %w", err)
+		if !isDeadAgentLoopError(err) {
+			return fmt.Errorf("codex app-server turn/start: %w", err)
+		}
+
+		failedThreadID := threadID
+		slog.Warn("codex app-server agent loop died; starting fresh thread", "thread_id", failedThreadID)
+		if recoveryErr := s.ensureThread(""); recoveryErr != nil {
+			s.alive.Store(false)
+			return fmt.Errorf("codex app-server turn/start fresh thread recovery after %v: %w", err, recoveryErr)
+		}
+
+		if !preambleAdded {
+			prompt = prependCodexPromptPreamble(prompt, s.promptPreamble)
+			input[0]["text"] = prompt
+		}
+		params["threadId"] = s.CurrentSessionID()
+		resp = turnStartResponse{}
+		if recoveryErr := s.request("turn/start", params, &resp); recoveryErr != nil {
+			s.alive.Store(false)
+			return fmt.Errorf("codex app-server turn/start fresh thread recovery retry after %v: %w", err, recoveryErr)
+		}
+		recovered = true
 	}
 	if resp.Turn.ID == "" {
+		if recovered {
+			s.alive.Store(false)
+		}
 		return fmt.Errorf("codex app-server turn/start returned empty turn id")
 	}
 
@@ -515,6 +542,9 @@ func (s *appServerSession) Send(prompt string, images []core.ImageAttachment, fi
 	s.fallbackMsgs = s.fallbackMsgs[:0]
 	clear(s.functionCalls)
 	s.stateMu.Unlock()
+	if recovered {
+		s.emit(core.Event{Type: core.EventSessionRecovered, SessionID: s.CurrentSessionID()})
+	}
 
 	return nil
 }
@@ -1175,7 +1205,7 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 	case "turn/completed":
 		var notif turnNotification
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil && s.isCurrentThread(notif.ThreadID) {
-			s.completeTurn(notif.Turn.ID)
+			s.completeTurn(notif.Turn.ID, turnCompletionError(notif))
 		}
 
 	case "thread/status/changed":
@@ -1188,7 +1218,7 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil &&
 			notif.Status.Type == "idle" && s.isCurrentThread(notif.ThreadID) {
 			// In codex 0.125+, thread going idle signals turn completion.
-			s.completeTurn("")
+			s.completeTurn("", nil)
 		}
 
 	case "account/rateLimits/updated":
@@ -1612,7 +1642,7 @@ func (s *appServerSession) isCurrentThread(threadID string) bool {
 	return threadID != "" && currentThreadID != "" && threadID == currentThreadID
 }
 
-func (s *appServerSession) completeTurn(turnID string) {
+func (s *appServerSession) completeTurn(turnID string, turnErr error) {
 	s.stateMu.Lock()
 	if s.currentTurn == "" || (turnID != "" && turnID != s.currentTurn) {
 		s.stateMu.Unlock()
@@ -1620,8 +1650,28 @@ func (s *appServerSession) completeTurn(turnID string) {
 	}
 	s.currentTurn = ""
 	s.stateMu.Unlock()
+	if turnErr != nil {
+		s.flushPendingAsThinking()
+		s.emit(core.Event{Type: core.EventError, SessionID: s.CurrentSessionID(), Error: turnErr})
+		return
+	}
 	s.flushPendingAsText()
 	s.emit(core.Event{Type: core.EventResult, SessionID: s.CurrentSessionID(), Done: true})
+}
+
+func turnCompletionError(notif turnNotification) error {
+	status := strings.ToLower(strings.TrimSpace(notif.Turn.Status))
+	if status == "" || status == "completed" {
+		return nil
+	}
+	if notif.Turn.Error != nil && strings.TrimSpace(notif.Turn.Error.Message) != "" {
+		return fmt.Errorf("%s", strings.TrimSpace(notif.Turn.Error.Message))
+	}
+	return fmt.Errorf("codex turn %s", status)
+}
+
+func isDeadAgentLoopError(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "agent loop died unexpectedly")
 }
 
 func (s *appServerSession) flushPendingAsThinking() {

@@ -4924,6 +4924,20 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		}
 
 		switch event.Type {
+		case EventSessionRecovered:
+			if event.SessionID != "" && session.GetAgentSessionID() != event.SessionID {
+				wasEmpty := session.GetAgentSessionID() == ""
+				session.SetAgentSessionID(event.SessionID, e.agent.Name())
+				if wasEmpty {
+					pendingName := session.GetName()
+					if pendingName != "" && pendingName != "session" && pendingName != "default" {
+						sessions.SetSessionName(event.SessionID, pendingName)
+					}
+				}
+				sessions.Save()
+			}
+			sendWorkspace(p, replyCtx, e.i18n.T(MsgSessionRecovered))
+
 		case EventThinking:
 			if isEllipsisOnly(event.Content) {
 				break

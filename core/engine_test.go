@@ -1628,6 +1628,39 @@ func TestProcessInteractiveEvents_HiddenToolProgressKeepsPreviewOnFinalize(t *te
 	}
 }
 
+func TestProcessInteractiveEvents_SessionRecoveryIsVisible(t *testing.T) {
+	p := &stubPlatformEngine{n: "discord"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	sessionKey := "discord:user1"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("thread-new")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-1",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventSessionRecovered, SessionID: "thread-new"}
+	agentSession.events <- Event{Type: EventResult, Content: "review complete", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-recovered", time.Now(), nil, nil, nil)
+
+	sent := p.getSent()
+	if len(sent) != 2 {
+		t.Fatalf("sent = %#v, want recovery warning and final reply", sent)
+	}
+	if !strings.Contains(sent[0], "session became unusable") || !strings.Contains(sent[0], "context may be incomplete") {
+		t.Fatalf("recovery warning = %q", sent[0])
+	}
+	if sent[1] != "review complete" {
+		t.Fatalf("final reply = %q, want review complete", sent[1])
+	}
+	if got := session.GetAgentSessionID(); got != "thread-new" {
+		t.Fatalf("persisted agent session ID = %q, want thread-new", got)
+	}
+}
+
 func TestProcessInteractiveEvents_ToolMessagesDisabledSuppressesToolProgressOnly(t *testing.T) {
 	p := &stubPlatformEngine{n: "telegram"}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
