@@ -312,6 +312,10 @@ const (
 	MsgCompressing          MsgKey = "compressing"
 	MsgCompressNoSession    MsgKey = "compress_no_session"
 	MsgCompressDone         MsgKey = "compress_done"
+	MsgSteerSent            MsgKey = "steer_sent"
+	MsgSteerSendFailed      MsgKey = "steer_send_failed"
+	MsgSteerEmpty           MsgKey = "steer_empty"
+	MsgSteerNotSupported    MsgKey = "steer_not_supported"
 
 	MsgMemoryNotSupported MsgKey = "memory_not_supported"
 	MsgMemoryShowProject  MsgKey = "memory_show_project"
@@ -378,31 +382,31 @@ const (
 	MsgCronIDLabel               MsgKey = "cron_id_label"
 	MsgCronFailedSuffix          MsgKey = "cron_failed_suffix"
 
-	MsgTimerNotAvailable  MsgKey = "timer_not_available"
-	MsgTimerUsage         MsgKey = "timer_usage"
-	MsgTimerAddUsage      MsgKey = "timer_add_usage"
-	MsgTimerAdded         MsgKey = "timer_added"
-	MsgTimerAddedExec     MsgKey = "timer_added_exec"
-	MsgTimerAddExecUsage  MsgKey = "timer_addexec_usage"
-	MsgTimerEmpty         MsgKey = "timer_empty"
-	MsgTimerListTitle     MsgKey = "timer_list_title"
-	MsgTimerListFooter    MsgKey = "timer_list_footer"
-	MsgTimerDelUsage      MsgKey = "timer_del_usage"
-	MsgTimerMuteUsage     MsgKey = "timer_mute_usage"
-	MsgTimerDeleted       MsgKey = "timer_deleted"
-	MsgTimerNotFound      MsgKey = "timer_not_found"
-	MsgTimerMuted         MsgKey = "timer_muted"
-	MsgTimerUnmuted       MsgKey = "timer_unmuted"
-	MsgTimerCardHint      MsgKey = "timer_card_hint"
-	MsgTimerBtnMute       MsgKey = "timer_btn_mute"
-	MsgTimerBtnUnmute     MsgKey = "timer_btn_unmute"
-	MsgTimerBtnDelete     MsgKey = "timer_btn_delete"
-	MsgTimerIDLabel       MsgKey = "timer_id_label"
-	MsgTimerScheduledLabel MsgKey = "timer_scheduled_label"
-	MsgTimerFailedSuffix  MsgKey = "timer_failed_suffix"
-	MsgCommandsTagAgent          MsgKey = "commands_tag_agent"
-	MsgCommandsTagShell          MsgKey = "commands_tag_shell"
-	MsgUpgradeTimeoutSuffix      MsgKey = "upgrade_timeout_suffix"
+	MsgTimerNotAvailable    MsgKey = "timer_not_available"
+	MsgTimerUsage           MsgKey = "timer_usage"
+	MsgTimerAddUsage        MsgKey = "timer_add_usage"
+	MsgTimerAdded           MsgKey = "timer_added"
+	MsgTimerAddedExec       MsgKey = "timer_added_exec"
+	MsgTimerAddExecUsage    MsgKey = "timer_addexec_usage"
+	MsgTimerEmpty           MsgKey = "timer_empty"
+	MsgTimerListTitle       MsgKey = "timer_list_title"
+	MsgTimerListFooter      MsgKey = "timer_list_footer"
+	MsgTimerDelUsage        MsgKey = "timer_del_usage"
+	MsgTimerMuteUsage       MsgKey = "timer_mute_usage"
+	MsgTimerDeleted         MsgKey = "timer_deleted"
+	MsgTimerNotFound        MsgKey = "timer_not_found"
+	MsgTimerMuted           MsgKey = "timer_muted"
+	MsgTimerUnmuted         MsgKey = "timer_unmuted"
+	MsgTimerCardHint        MsgKey = "timer_card_hint"
+	MsgTimerBtnMute         MsgKey = "timer_btn_mute"
+	MsgTimerBtnUnmute       MsgKey = "timer_btn_unmute"
+	MsgTimerBtnDelete       MsgKey = "timer_btn_delete"
+	MsgTimerIDLabel         MsgKey = "timer_id_label"
+	MsgTimerScheduledLabel  MsgKey = "timer_scheduled_label"
+	MsgTimerFailedSuffix    MsgKey = "timer_failed_suffix"
+	MsgCommandsTagAgent     MsgKey = "commands_tag_agent"
+	MsgCommandsTagShell     MsgKey = "commands_tag_shell"
+	MsgUpgradeTimeoutSuffix MsgKey = "upgrade_timeout_suffix"
 
 	MsgCronScheduleLabel MsgKey = "cron_schedule_label"
 	MsgCronNextRunLabel  MsgKey = "cron_next_run_label"
@@ -566,6 +570,7 @@ const (
 	MsgBuiltinCmdQuiet     MsgKey = "quiet"
 	MsgBuiltinCmdCompress  MsgKey = "compress"
 	MsgBuiltinCmdStop      MsgKey = "stop"
+	MsgBuiltinCmdSteer     MsgKey = "steer"
 	MsgBuiltinCmdCron      MsgKey = "cron"
 	MsgBuiltinCmdCommands  MsgKey = "commands"
 	MsgBuiltinCmdAlias     MsgKey = "alias"
@@ -731,11 +736,11 @@ var messages = map[MsgKey]map[Language]string{
 		LangSpanish:            "No hay ejecución en progreso.",
 	},
 	MsgPreviousProcessing: {
-		LangEnglish:            "⏳ Previous request still processing. Use `/ps <message>` to send a P.S. to the running task.",
-		LangChinese:            "⏳ 上一个请求仍在处理中。使用 `/ps <消息>` 可向正在执行的任务追加补充信息。",
-		LangTraditionalChinese: "⏳ 上一個請求仍在處理中。使用 `/ps <訊息>` 可向正在執行的任務追加補充資訊。",
-		LangJapanese:           "⏳ 前のリクエストを処理中です。`/ps <メッセージ>` で実行中のタスクに補足情報を送れます。",
-		LangSpanish:            "⏳ La solicitud anterior aún se está procesando. Use `/ps <mensaje>` para enviar un P.S. a la tarea en curso.",
+		LangEnglish:            "⏳ Previous request still processing. Use `/steer <message>` to add guidance to the current task.",
+		LangChinese:            "⏳ 上一个请求仍在处理中。使用 `/steer <消息>` 可向当前任务追加引导。",
+		LangTraditionalChinese: "⏳ 上一個請求仍在處理中。使用 `/steer <訊息>` 可向當前任務追加引導。",
+		LangJapanese:           "⏳ 前のリクエストを処理中です。`/steer <メッセージ>` で現在のタスクに追加の指示を送れます。",
+		LangSpanish:            "⏳ La solicitud anterior aún se está procesando. Use `/steer <mensaje>` para agregar instrucciones a la tarea actual.",
 	},
 	MsgMessageQueued: {
 		LangEnglish:            "📬 Message received — will process after the current task finishes.",
@@ -2375,6 +2380,34 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "✅ コンテキスト圧縮完了。",
 		LangSpanish:            "✅ Contexto comprimido.",
 	},
+	MsgSteerSent: {
+		LangEnglish:            "✅ Guidance sent to the current task.",
+		LangChinese:            "✅ 已向当前任务发送引导。",
+		LangTraditionalChinese: "✅ 已向當前任務送出引導。",
+		LangJapanese:           "✅ 現在のタスクに追加の指示を送信しました。",
+		LangSpanish:            "✅ Instrucciones enviadas a la tarea actual.",
+	},
+	MsgSteerSendFailed: {
+		LangEnglish:            "❌ Failed to send guidance to the current task.",
+		LangChinese:            "❌ 向当前任务发送引导失败。",
+		LangTraditionalChinese: "❌ 向當前任務送出引導失敗。",
+		LangJapanese:           "❌ 現在のタスクへの追加指示の送信に失敗しました。",
+		LangSpanish:            "❌ Error al enviar instrucciones a la tarea actual.",
+	},
+	MsgSteerEmpty: {
+		LangEnglish:            "Usage: `/steer <message>`",
+		LangChinese:            "用法：`/steer <消息>`",
+		LangTraditionalChinese: "用法：`/steer <訊息>`",
+		LangJapanese:           "使い方：`/steer <メッセージ>`",
+		LangSpanish:            "Uso: `/steer <mensaje>`",
+	},
+	MsgSteerNotSupported: {
+		LangEnglish:            "❌ This agent does not support `/steer`.",
+		LangChinese:            "❌ 当前 Agent 不支持 `/steer`。",
+		LangTraditionalChinese: "❌ 當前 Agent 不支援 `/steer`。",
+		LangJapanese:           "❌ このエージェントは `/steer` をサポートしていません。",
+		LangSpanish:            "❌ Este agente no admite `/steer`.",
+	},
 
 	// Inline strings for engine.go commands
 	MsgStatusMode: {
@@ -3664,6 +3697,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "停止當前執行",
 		LangJapanese:           "現在の実行を停止",
 		LangSpanish:            "Detener ejecución actual",
+	},
+	MsgBuiltinCmdSteer: {
+		LangEnglish:            "Add guidance to the current in-flight task",
+		LangChinese:            "向当前执行中的任务追加引导",
+		LangTraditionalChinese: "向當前執行中的任務追加引導",
+		LangJapanese:           "現在実行中のタスクに追加の指示を送る",
+		LangSpanish:            "Agregar instrucciones a la tarea en curso",
 	},
 	MsgBuiltinCmdCron: {
 		LangEnglish:            "Manage scheduled tasks, arg: [add|list|exec|del|enable|disable]",

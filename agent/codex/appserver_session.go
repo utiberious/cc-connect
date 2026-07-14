@@ -64,6 +64,10 @@ type turnStartResponse struct {
 	} `json:"turn"`
 }
 
+type turnSteerResponse struct {
+	TurnID string `json:"turnId"`
+}
+
 type turnNotification struct {
 	ThreadID string `json:"threadId"`
 	Turn     struct {
@@ -176,10 +180,12 @@ type appServerSession struct {
 	closeOnce sync.Once
 	wg        sync.WaitGroup
 
-	stateMu      sync.Mutex
-	pendingMsgs  []string
-	currentTurn  string
-	preambleSent bool
+	stateMu       sync.Mutex
+	pendingMsgs   []string
+	fallbackMsgs  []string
+	functionCalls map[string]string
+	currentTurn   string
+	preambleSent  bool
 
 	runtimeMu sync.RWMutex
 	usage     *core.UsageReport
@@ -506,8 +512,49 @@ func (s *appServerSession) Send(prompt string, images []core.ImageAttachment, fi
 	s.stateMu.Lock()
 	s.currentTurn = resp.Turn.ID
 	s.pendingMsgs = s.pendingMsgs[:0]
+	s.fallbackMsgs = s.fallbackMsgs[:0]
+	clear(s.functionCalls)
 	s.stateMu.Unlock()
 
+	return nil
+}
+
+// Steer appends additional guidance to the currently active regular turn.
+// This uses Codex app-server's native same-turn steering API rather than
+// starting a new turn.
+func (s *appServerSession) Steer(prompt string) error {
+	if !s.alive.Load() {
+		return fmt.Errorf("session is closed")
+	}
+
+	threadID := s.CurrentSessionID()
+	if threadID == "" {
+		return fmt.Errorf("codex app-server thread id is empty")
+	}
+
+	s.stateMu.Lock()
+	turnID := s.currentTurn
+	s.stateMu.Unlock()
+	if turnID == "" {
+		return fmt.Errorf("codex app-server has no active turn to steer")
+	}
+
+	params := map[string]any{
+		"threadId":       threadID,
+		"expectedTurnId": turnID,
+		"input": []map[string]any{{
+			"type": "text",
+			"text": prompt,
+		}},
+	}
+
+	var resp turnSteerResponse
+	if err := s.request("turn/steer", params, &resp); err != nil {
+		return fmt.Errorf("codex app-server turn/steer: %w", err)
+	}
+	if resp.TurnID == "" {
+		return fmt.Errorf("codex app-server turn/steer returned empty turn id")
+	}
 	return nil
 }
 
@@ -1103,30 +1150,32 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 	switch method {
 	case "turn/started":
 		var notif turnNotification
-		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
+		if err := json.Unmarshal(paramsRaw, &notif); err == nil && s.isCurrentThread(notif.ThreadID) {
 			s.stateMu.Lock()
 			s.currentTurn = notif.Turn.ID
 			s.pendingMsgs = s.pendingMsgs[:0]
+			s.fallbackMsgs = s.fallbackMsgs[:0]
+			clear(s.functionCalls)
 			s.stateMu.Unlock()
 			s.storeContextUsage(nil)
 		}
 
 	case "item/started":
 		var notif itemNotification
-		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
+		if err := json.Unmarshal(paramsRaw, &notif); err == nil && s.isCurrentThread(notif.ThreadID) {
 			s.handleItemStarted(notif.Item)
 		}
 
 	case "item/completed":
 		var notif itemNotification
-		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
+		if err := json.Unmarshal(paramsRaw, &notif); err == nil && s.isCurrentThread(notif.ThreadID) {
 			s.handleItemCompleted(notif.Item)
 		}
 
 	case "turn/completed":
 		var notif turnNotification
-		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
-			s.completeTurn()
+		if err := json.Unmarshal(paramsRaw, &notif); err == nil && s.isCurrentThread(notif.ThreadID) {
+			s.completeTurn(notif.Turn.ID)
 		}
 
 	case "thread/status/changed":
@@ -1136,9 +1185,10 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 				Type string `json:"type"`
 			} `json:"status"`
 		}
-		if err := json.Unmarshal(paramsRaw, &notif); err == nil && notif.Status.Type == "idle" {
+		if err := json.Unmarshal(paramsRaw, &notif); err == nil &&
+			notif.Status.Type == "idle" && s.isCurrentThread(notif.ThreadID) {
 			// In codex 0.125+, thread going idle signals turn completion.
-			s.completeTurn()
+			s.completeTurn("")
 		}
 
 	case "account/rateLimits/updated":
@@ -1149,7 +1199,7 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 
 	case "thread/tokenUsage/updated":
 		var notif appServerThreadTokenUsageNotification
-		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
+		if err := json.Unmarshal(paramsRaw, &notif); err == nil && s.isCurrentThread(notif.ThreadID) {
 			s.storeContextUsage(mapAppServerTokenUsage(notif))
 		}
 
@@ -1170,9 +1220,11 @@ func (s *appServerSession) handleItemStarted(item map[string]any) {
 	switch itemType {
 	case "agentMessage", "reasoning", "userMessage", "plan", "hookPrompt", "contextCompaction":
 		return
+	case "commandExecution", "mcpToolCall", "webSearch", "dynamicToolCall", "fileChange", "function_call", "collabAgentToolCall":
+		s.flushPendingAsThinking()
+	default:
+		return
 	}
-
-	s.flushPendingAsThinking()
 
 	switch itemType {
 	case "commandExecution":
@@ -1195,6 +1247,20 @@ func (s *appServerSession) handleItemStarted(item map[string]any) {
 
 	case "fileChange":
 		s.emit(core.Event{Type: core.EventToolUse, ToolName: "Patch", ToolInput: appServerJSON(item["changes"])})
+
+	case "function_call":
+		name, _ := item["name"].(string)
+		callID, _ := item["call_id"].(string)
+		s.rememberFunctionCall(callID, name)
+		s.emit(core.Event{Type: core.EventToolUse, ToolName: name, ToolInput: appServerOutputText(item["arguments"])})
+
+	case "collabAgentToolCall":
+		tool, _ := item["tool"].(string)
+		input, _ := item["prompt"].(string)
+		if strings.TrimSpace(input) == "" {
+			input = appServerJSON(item["receiverThreadIds"])
+		}
+		s.emit(core.Event{Type: core.EventToolUse, ToolName: tool, ToolInput: input})
 	}
 }
 
@@ -1218,6 +1284,32 @@ func (s *appServerSession) handleItemCompleted(item map[string]any) {
 			s.pendingMsgs = append(s.pendingMsgs, text)
 			s.stateMu.Unlock()
 		}
+
+	case "function_call":
+		name, _ := item["name"].(string)
+		callID, _ := item["call_id"].(string)
+		s.rememberFunctionCall(callID, name)
+
+	case "function_call_output":
+		callID, _ := item["call_id"].(string)
+		name := s.takeFunctionCall(callID)
+		s.emit(core.Event{
+			Type:       core.EventToolResult,
+			ToolName:   name,
+			ToolResult: truncate(strings.TrimSpace(appServerOutputText(item["output"])), 500),
+		})
+
+	case "collabAgentToolCall":
+		tool, _ := item["tool"].(string)
+		status, _ := item["status"].(string)
+		success := appServerToolSuccess(status, nil)
+		s.emit(core.Event{
+			Type:        core.EventToolResult,
+			ToolName:    tool,
+			ToolResult:  truncate(strings.TrimSpace(appServerJSON(item["agentsStates"])), 500),
+			ToolStatus:  strings.TrimSpace(status),
+			ToolSuccess: &success,
+		})
 
 	case "commandExecution":
 		command, _ := item["command"].(string)
@@ -1318,6 +1410,13 @@ func appServerDynamicToolText(raw any) string {
 		return appServerJSON(raw)
 	}
 	return strings.Join(parts, "\n")
+}
+
+func appServerOutputText(raw any) string {
+	if text, ok := raw.(string); ok {
+		return text
+	}
+	return appServerDynamicToolText(raw)
 }
 
 func appServerToolSuccess(status string, exitCode *int) bool {
@@ -1508,9 +1607,14 @@ func rpcIDToInt64(v any) (int64, bool) {
 	return 0, false
 }
 
-func (s *appServerSession) completeTurn() {
+func (s *appServerSession) isCurrentThread(threadID string) bool {
+	currentThreadID := s.CurrentSessionID()
+	return threadID != "" && currentThreadID != "" && threadID == currentThreadID
+}
+
+func (s *appServerSession) completeTurn(turnID string) {
 	s.stateMu.Lock()
-	if s.currentTurn == "" {
+	if s.currentTurn == "" || (turnID != "" && turnID != s.currentTurn) {
 		s.stateMu.Unlock()
 		return
 	}
@@ -1524,6 +1628,7 @@ func (s *appServerSession) flushPendingAsThinking() {
 	s.stateMu.Lock()
 	msgs := append([]string(nil), s.pendingMsgs...)
 	s.pendingMsgs = s.pendingMsgs[:0]
+	s.fallbackMsgs = append(s.fallbackMsgs, msgs...)
 	s.stateMu.Unlock()
 
 	for _, text := range msgs {
@@ -1536,7 +1641,12 @@ func (s *appServerSession) flushPendingAsThinking() {
 func (s *appServerSession) flushPendingAsText() {
 	s.stateMu.Lock()
 	msgs := append([]string(nil), s.pendingMsgs...)
+	if len(msgs) == 0 {
+		msgs = append(msgs, s.fallbackMsgs...)
+	}
 	s.pendingMsgs = s.pendingMsgs[:0]
+	s.fallbackMsgs = s.fallbackMsgs[:0]
+	clear(s.functionCalls)
 	s.stateMu.Unlock()
 
 	for _, text := range msgs {
@@ -1544,6 +1654,29 @@ func (s *appServerSession) flushPendingAsText() {
 			s.emit(core.Event{Type: core.EventText, Content: text})
 		}
 	}
+}
+
+func (s *appServerSession) rememberFunctionCall(callID, name string) {
+	if callID == "" {
+		return
+	}
+	s.stateMu.Lock()
+	if s.functionCalls == nil {
+		s.functionCalls = make(map[string]string)
+	}
+	s.functionCalls[callID] = name
+	s.stateMu.Unlock()
+}
+
+func (s *appServerSession) takeFunctionCall(callID string) string {
+	s.stateMu.Lock()
+	name := s.functionCalls[callID]
+	delete(s.functionCalls, callID)
+	s.stateMu.Unlock()
+	if name == "" {
+		return "Function"
+	}
+	return name
 }
 
 func (s *appServerSession) emit(event core.Event) {

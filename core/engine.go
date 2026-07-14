@@ -2904,6 +2904,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		if e.handleCommand(p, msg, content) {
 			return
 		}
+		content = strings.TrimSpace(msg.Content)
 		// Unrecognized slash command — fall through to agent as normal message
 	}
 
@@ -6262,6 +6263,7 @@ var builtinCommands = []struct {
 	{[]string{"compress", "compact"}, "compress"},
 	{[]string{"stop"}, "stop"},
 	{[]string{"cancel"}, "cancel"},
+	{[]string{"steer"}, "steer"},
 	{[]string{"help"}, "help"},
 	{[]string{"version"}, "version"},
 	{[]string{"commands", "command", "cmd"}, "commands"},
@@ -6483,6 +6485,8 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		e.cmdStop(p, msg)
 	case "cancel":
 		e.cmdCancel(p, msg)
+	case "steer":
+		return e.cmdSteer(p, msg, args)
 	case "help":
 		e.cmdHelp(p, msg)
 	case "start":
@@ -9259,6 +9263,7 @@ func helpCardGroups() []helpCardGroup {
 				{command: "/alias", action: "nav:/alias"},
 				{command: "/skills", action: "nav:/skills"},
 				{command: "/compress", action: "cmd:/compress"},
+				{command: "/steer", action: "cmd:/steer"},
 				{command: "/stop", action: "act:/stop"},
 				{command: "/ps", action: "cmd:/ps"},
 			},
@@ -10034,6 +10039,53 @@ func (e *Engine) cmdCancel(p Platform, msg *Message) {
 	sessions.NewSession(msg.SessionKey, "")
 
 	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSessionCancelled))
+}
+
+func (e *Engine) cmdSteer(p Platform, msg *Message, args []string) bool {
+	text := strings.TrimSpace(strings.Join(args, " "))
+	if text == "" {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSteerEmpty))
+		return true
+	}
+
+	_, sessions := e.sessionContextForKey(msg.SessionKey)
+	session := sessions.GetOrCreateActive(msg.SessionKey)
+	if !session.Busy() {
+		msg.Content = text
+		return false
+	}
+
+	iKey := e.interactiveKeyForSessionKey(msg.SessionKey)
+	e.interactiveMu.Lock()
+	state, ok := e.interactiveStates[iKey]
+	e.interactiveMu.Unlock()
+
+	if !ok || state == nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgNoExecution))
+		return true
+	}
+	state.mu.Lock()
+	agentSession := state.agentSession
+	state.mu.Unlock()
+	if agentSession == nil || !agentSession.Alive() {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgNoExecution))
+		return true
+	}
+
+	steerer, ok := agentSession.(SessionSteerer)
+	if !ok {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSteerNotSupported))
+		return true
+	}
+
+	if err := steerer.Steer(text); err != nil {
+		slog.Error("steer: send failed", "error", err)
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSteerSendFailed))
+		return true
+	}
+
+	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSteerSent))
+	return true
 }
 
 func (e *Engine) stopInteractiveSession(sessionKey string, quietPlatform Platform, quietReplyCtx any) bool {
