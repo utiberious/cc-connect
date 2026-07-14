@@ -3,6 +3,7 @@ package claudecode
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"os/exec"
@@ -13,6 +14,12 @@ import (
 
 	"github.com/chenhg5/cc-connect/core"
 )
+
+type nopWriteCloser struct {
+	io.Writer
+}
+
+func (nopWriteCloser) Close() error { return nil }
 
 func TestHandleResultParsesUsage(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -245,6 +252,41 @@ func TestHandleResultNoUsage(t *testing.T) {
 	}
 	if evt.OutputTokens != 0 {
 		t.Errorf("OutputTokens = %d, want 0", evt.OutputTokens)
+	}
+}
+
+func TestClaudeSessionSteer_UsesNextPriorityUserMessage(t *testing.T) {
+	var buf bytes.Buffer
+	cs := &claudeSession{
+		stdin: nopWriteCloser{Writer: &buf},
+	}
+	cs.alive.Store(true)
+
+	if err := cs.Steer("focus on failing tests first"); err != nil {
+		t.Fatalf("Steer() error = %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &payload); err != nil {
+		t.Fatalf("decode steer payload: %v", err)
+	}
+
+	if got := payload["type"]; got != "user" {
+		t.Fatalf("type = %#v, want user", got)
+	}
+	if got := payload["priority"]; got != "next" {
+		t.Fatalf("priority = %#v, want next", got)
+	}
+
+	message, ok := payload["message"].(map[string]any)
+	if !ok {
+		t.Fatalf("message = %#v, want object", payload["message"])
+	}
+	if got := message["role"]; got != "user" {
+		t.Fatalf("message.role = %#v, want user", got)
+	}
+	if got := message["content"]; got != "focus on failing tests first" {
+		t.Fatalf("message.content = %#v, want steer text", got)
 	}
 }
 
@@ -631,9 +673,9 @@ func makeFiller(n int) string {
 // assistant text reaches the user.
 //
 // Cases covered:
-//  - string content (plain text result)
-//  - array content (Anthropic SDK multi-block: [{type:"text", text:"..."}])
-//  - is_error=true (exit code 1, success=false)
+//   - string content (plain text result)
+//   - array content (Anthropic SDK multi-block: [{type:"text", text:"..."}])
+//   - is_error=true (exit code 1, success=false)
 func TestHandleUserEmitsToolResult(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -649,10 +691,10 @@ func TestHandleUserEmitsToolResult(t *testing.T) {
 				"message": map[string]any{
 					"content": []any{
 						map[string]any{
-							"type":          "tool_result",
-							"tool_use_id":   "toolu_abc",
-							"is_error":      false,
-							"content":       "command output here",
+							"type":        "tool_result",
+							"tool_use_id": "toolu_abc",
+							"is_error":    false,
+							"content":     "command output here",
 						},
 					},
 				},

@@ -76,6 +76,7 @@ func TestAppServerSession_HandleRateLimitsUpdatedCachesUsage(t *testing.T) {
 
 func TestAppServerSession_HandleThreadTokenUsageUpdatedCachesContextUsage(t *testing.T) {
 	s := &appServerSession{}
+	s.threadID.Store("thread-1")
 	raw, err := json.Marshal(appServerThreadTokenUsageNotification{
 		ThreadID: "thread-1",
 		TurnID:   "turn-1",
@@ -339,6 +340,363 @@ func TestAppServerSession_HandleRequestUserInputWritesCodexResponse(t *testing.T
 	got := envelope.Result.Answers["database"].Answers
 	if len(got) != 1 || got[0] != "Postgres" {
 		t.Fatalf("answers[database] = %#v, want [Postgres]", got)
+	}
+}
+
+func TestAppServerSession_UnknownItemDoesNotDrainFinalText(t *testing.T) {
+	s := newAppServerEventTestSession()
+
+	notifyAppServerTest(t, s, "item/completed", map[string]any{
+		"item": map[string]any{"type": "agentMessage", "text": "I found the relevant path."},
+	})
+	notifyAppServerTest(t, s, "item/started", map[string]any{
+		"item": map[string]any{"type": "futureToolCall"},
+	})
+	notifyAppServerTest(t, s, "item/completed", map[string]any{
+		"item": map[string]any{"type": "futureToolCall"},
+	})
+	notifyAppServerTest(t, s, "turn/completed", map[string]any{})
+
+	events := drainAppServerTestEvents(s)
+	if len(events) != 2 {
+		t.Fatalf("events = %#v, want EventText followed by EventResult", events)
+	}
+	if events[0].Type != core.EventText || events[0].Content != "I found the relevant path." {
+		t.Fatalf("events[0] = %#v, want preserved EventText", events[0])
+	}
+	if events[1].Type != core.EventResult || !events[1].Done {
+		t.Fatalf("events[1] = %#v, want completed EventResult", events[1])
+	}
+}
+
+func TestAppServerSession_FunctionCallKeepsAssistantTextAsFinalFallback(t *testing.T) {
+	s := newAppServerEventTestSession()
+
+	notifyAppServerTest(t, s, "item/completed", map[string]any{
+		"item": map[string]any{"type": "agentMessage", "text": "I delegated the review."},
+	})
+	functionCall := map[string]any{
+		"type":      "function_call",
+		"name":      "spawn_agent",
+		"call_id":   "call-1",
+		"arguments": `{"agent_type":"critic"}`,
+	}
+	notifyAppServerTest(t, s, "item/started", map[string]any{"item": functionCall})
+	notifyAppServerTest(t, s, "item/completed", map[string]any{"item": functionCall})
+	notifyAppServerTest(t, s, "item/completed", map[string]any{
+		"item": map[string]any{
+			"type":    "function_call_output",
+			"call_id": "call-1",
+			"output":  "agent Cicero spawned",
+		},
+	})
+	notifyAppServerTest(t, s, "turn/completed", map[string]any{})
+
+	events := drainAppServerTestEvents(s)
+	assertAppServerEvent(t, events, core.EventToolUse, "spawn_agent", `{"agent_type":"critic"}`)
+	assertAppServerEvent(t, events, core.EventToolResult, "spawn_agent", "agent Cicero spawned")
+	textIndex := appServerEventIndex(events, core.EventText)
+	resultIndex := appServerEventIndex(events, core.EventResult)
+	if textIndex < 0 || resultIndex < 0 || textIndex >= resultIndex {
+		t.Fatalf("events = %#v, want EventText before EventResult", events)
+	}
+	if events[textIndex].Content != "I delegated the review." {
+		t.Fatalf("final fallback = %q, want delegated review text", events[textIndex].Content)
+	}
+}
+
+func TestAppServerSession_CollabAgentCallKeepsAssistantTextAsFinalFallback(t *testing.T) {
+	s := newAppServerEventTestSession()
+
+	notifyAppServerTest(t, s, "item/completed", map[string]any{
+		"item": map[string]any{"type": "agentMessage", "text": "Waiting for the reviewer."},
+	})
+	notifyAppServerTest(t, s, "item/started", map[string]any{
+		"item": map[string]any{
+			"type":   "collabAgentToolCall",
+			"tool":   "wait",
+			"prompt": "Cicero",
+		},
+	})
+	notifyAppServerTest(t, s, "item/completed", map[string]any{
+		"item": map[string]any{
+			"type":         "collabAgentToolCall",
+			"tool":         "wait",
+			"status":       "completed",
+			"agentsStates": map[string]any{"Cicero": "completed"},
+		},
+	})
+	notifyAppServerTest(t, s, "turn/completed", map[string]any{})
+
+	events := drainAppServerTestEvents(s)
+	assertAppServerEvent(t, events, core.EventToolUse, "wait", "Cicero")
+	assertAppServerEvent(t, events, core.EventToolResult, "wait", `{"Cicero":"completed"}`)
+	textIndex := appServerEventIndex(events, core.EventText)
+	resultIndex := appServerEventIndex(events, core.EventResult)
+	if textIndex < 0 || resultIndex < 0 || textIndex >= resultIndex {
+		t.Fatalf("events = %#v, want EventText before EventResult", events)
+	}
+}
+
+func TestAppServerSession_FinalMessageTakesPrecedenceOverFallback(t *testing.T) {
+	s := newAppServerEventTestSession()
+
+	notifyAppServerTest(t, s, "item/completed", map[string]any{
+		"item": map[string]any{"type": "agentMessage", "text": "I am checking the repository."},
+	})
+	notifyAppServerTest(t, s, "item/started", map[string]any{
+		"item": map[string]any{"type": "commandExecution", "command": "git status"},
+	})
+	notifyAppServerTest(t, s, "item/completed", map[string]any{
+		"item": map[string]any{"type": "agentMessage", "text": "The repository is clean."},
+	})
+	notifyAppServerTest(t, s, "turn/completed", map[string]any{})
+
+	events := drainAppServerTestEvents(s)
+	var textEvents []core.Event
+	for _, event := range events {
+		if event.Type == core.EventText {
+			textEvents = append(textEvents, event)
+		}
+	}
+	if len(textEvents) != 1 || textEvents[0].Content != "The repository is clean." {
+		t.Fatalf("text events = %#v, want only the final agent message", textEvents)
+	}
+}
+
+func TestAppServerSession_ChildTurnDoesNotReplaceOrCompleteParentTurn(t *testing.T) {
+	s := newAppServerEventTestSession()
+	s.threadID.Store("parent-thread")
+	s.currentTurn = "parent-turn"
+	s.pendingMsgs = []string{"parent response"}
+
+	notifyAppServerTest(t, s, "turn/started", map[string]any{
+		"threadId": "child-thread",
+		"turn":     map[string]any{"id": "child-turn"},
+	})
+	notifyAppServerTest(t, s, "turn/completed", map[string]any{
+		"threadId": "child-thread",
+		"turn":     map[string]any{"id": "child-turn"},
+	})
+	notifyAppServerTest(t, s, "thread/status/changed", map[string]any{
+		"threadId": "child-thread",
+		"status":   map[string]any{"type": "idle"},
+	})
+	notifyAppServerTest(t, s, "item/completed", map[string]any{
+		"threadId": "child-thread",
+		"turnId":   "child-turn",
+		"item":     map[string]any{"type": "agentMessage", "text": "child response"},
+	})
+	notifyAppServerTest(t, s, "item/started", map[string]any{
+		"threadId": "child-thread",
+		"turnId":   "child-turn",
+		"item":     map[string]any{"type": "commandExecution", "command": "go test ./..."},
+	})
+
+	s.stateMu.Lock()
+	currentTurn := s.currentTurn
+	pendingMsgs := append([]string(nil), s.pendingMsgs...)
+	s.stateMu.Unlock()
+	if currentTurn != "parent-turn" {
+		t.Fatalf("currentTurn = %q, want parent-turn", currentTurn)
+	}
+	if len(pendingMsgs) != 1 || pendingMsgs[0] != "parent response" {
+		t.Fatalf("pendingMsgs = %#v, want parent response preserved", pendingMsgs)
+	}
+	if events := drainAppServerTestEvents(s); len(events) != 0 {
+		t.Fatalf("child turn emitted events: %#v", events)
+	}
+
+	notifyAppServerTest(t, s, "turn/completed", map[string]any{
+		"threadId": "parent-thread",
+		"turn":     map[string]any{"id": "parent-turn"},
+	})
+	events := drainAppServerTestEvents(s)
+	if len(events) != 2 || events[0].Type != core.EventText || events[1].Type != core.EventResult {
+		t.Fatalf("parent completion events = %#v, want EventText followed by EventResult", events)
+	}
+}
+
+func TestAppServerSession_StaleParentTurnCompletionDoesNotCompleteActiveTurn(t *testing.T) {
+	s := newAppServerEventTestSession()
+	s.threadID.Store("parent-thread")
+	s.currentTurn = "active-turn"
+
+	notifyAppServerTest(t, s, "turn/completed", map[string]any{
+		"threadId": "parent-thread",
+		"turn":     map[string]any{"id": "stale-turn"},
+	})
+
+	s.stateMu.Lock()
+	currentTurn := s.currentTurn
+	s.stateMu.Unlock()
+	if currentTurn != "active-turn" {
+		t.Fatalf("currentTurn = %q, want active-turn", currentTurn)
+	}
+	if events := drainAppServerTestEvents(s); len(events) != 0 {
+		t.Fatalf("stale turn completion emitted events: %#v", events)
+	}
+}
+
+func TestAppServerSession_MissingThreadIDDoesNotMutateParentTurn(t *testing.T) {
+	s := newAppServerEventTestSession()
+	s.currentTurn = "parent-turn"
+	s.pendingMsgs = []string{"parent response"}
+
+	raw, err := json.Marshal(map[string]any{
+		"turn": map[string]any{"id": "unknown-turn"},
+	})
+	if err != nil {
+		t.Fatalf("marshal notification: %v", err)
+	}
+	s.handleNotification("turn/started", raw)
+
+	s.stateMu.Lock()
+	currentTurn := s.currentTurn
+	pendingMsgs := append([]string(nil), s.pendingMsgs...)
+	s.stateMu.Unlock()
+	if currentTurn != "parent-turn" {
+		t.Fatalf("currentTurn = %q, want parent-turn", currentTurn)
+	}
+	if len(pendingMsgs) != 1 || pendingMsgs[0] != "parent response" {
+		t.Fatalf("pendingMsgs = %#v, want parent response preserved", pendingMsgs)
+	}
+}
+
+func newAppServerEventTestSession() *appServerSession {
+	s := &appServerSession{
+		events:      make(chan core.Event, 16),
+		currentTurn: "turn-1",
+	}
+	s.threadID.Store("thread-1")
+	return s
+}
+
+func notifyAppServerTest(t *testing.T, s *appServerSession, method string, params any) {
+	t.Helper()
+	if values, ok := params.(map[string]any); ok {
+		if _, exists := values["threadId"]; !exists {
+			values["threadId"] = s.CurrentSessionID()
+		}
+	}
+	raw, err := json.Marshal(params)
+	if err != nil {
+		t.Fatalf("marshal %s notification: %v", method, err)
+	}
+	s.handleNotification(method, raw)
+}
+
+func drainAppServerTestEvents(s *appServerSession) []core.Event {
+	var events []core.Event
+	for len(s.events) > 0 {
+		events = append(events, <-s.events)
+	}
+	return events
+}
+
+func assertAppServerEvent(t *testing.T, events []core.Event, eventType core.EventType, toolName, content string) {
+	t.Helper()
+	for _, event := range events {
+		if event.Type != eventType || event.ToolName != toolName {
+			continue
+		}
+		if eventType == core.EventToolUse && event.ToolInput == content {
+			return
+		}
+		if eventType == core.EventToolResult && event.ToolResult == content {
+			return
+		}
+	}
+	t.Fatalf("events = %#v, missing %s for %s with content %q", events, eventType, toolName, content)
+}
+
+func appServerEventIndex(events []core.Event, eventType core.EventType) int {
+	for i, event := range events {
+		if event.Type == eventType {
+			return i
+		}
+	}
+	return -1
+}
+
+func TestAppServerSessionSteer_RequiresActiveTurn(t *testing.T) {
+	s := &appServerSession{
+		ctx:     context.Background(),
+		pending: make(map[int64]chan rpcResponseEnvelope),
+	}
+	s.alive.Store(true)
+	s.threadID.Store("thread-1")
+
+	err := s.Steer("focus on failing tests first")
+	if err == nil || err.Error() != "codex app-server has no active turn to steer" {
+		t.Fatalf("Steer() error = %v, want no active turn error", err)
+	}
+}
+
+func TestAppServerSessionSteer_RequestShape(t *testing.T) {
+	stdin := &lockedWriteCloser{}
+	s := &appServerSession{
+		ctx:     context.Background(),
+		stdin:   stdin,
+		pending: make(map[int64]chan rpcResponseEnvelope),
+	}
+	s.alive.Store(true)
+	s.threadID.Store("thread-1")
+	s.currentTurn = "turn-1"
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			s.pendingMu.Lock()
+			ch := s.pending[1]
+			s.pendingMu.Unlock()
+			if ch != nil {
+				ch <- rpcResponseEnvelope{ID: int64(1), Result: json.RawMessage(`{"turnId":"turn-1"}`)}
+				return
+			}
+		}
+	}()
+
+	if err := s.Steer("focus on failing tests first"); err != nil {
+		t.Fatalf("Steer() error = %v", err)
+	}
+	wg.Wait()
+
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdin.String())), &payload); err != nil {
+		t.Fatalf("decode steer payload: %v", err)
+	}
+
+	if got := payload["method"]; got != "turn/steer" {
+		t.Fatalf("method = %#v, want turn/steer", got)
+	}
+
+	params, ok := payload["params"].(map[string]any)
+	if !ok {
+		t.Fatalf("params = %#v, want object", payload["params"])
+	}
+	if got := params["threadId"]; got != "thread-1" {
+		t.Fatalf("threadId = %#v, want thread-1", got)
+	}
+	if got := params["expectedTurnId"]; got != "turn-1" {
+		t.Fatalf("expectedTurnId = %#v, want turn-1", got)
+	}
+
+	input, ok := params["input"].([]any)
+	if !ok || len(input) != 1 {
+		t.Fatalf("input = %#v, want single-element array", params["input"])
+	}
+	item, ok := input[0].(map[string]any)
+	if !ok {
+		t.Fatalf("input[0] = %#v, want object", input[0])
+	}
+	if got := item["type"]; got != "text" {
+		t.Fatalf("input[0].type = %#v, want text", got)
+	}
+	if got := item["text"]; got != "focus on failing tests first" {
+		t.Fatalf("input[0].text = %#v, want steer text", got)
 	}
 }
 
