@@ -1435,11 +1435,14 @@ func TestApplyReferencedMessage_PrependsAuthorAndContent(t *testing.T) {
 		Author:  &discordgo.User{Username: "alice"},
 		Content: "hello world",
 	}
-	content, images := applyReferencedMessage(ref, "my reply", nil, nil)
+	content, extraContent, images := applyReferencedMessage(ref, "my reply", nil, nil)
 
-	wantContent := "[replying to alice: hello world]\nmy reply"
-	if content != wantContent {
-		t.Fatalf("content = %q, want %q", content, wantContent)
+	if content != "my reply" {
+		t.Fatalf("content = %q, want raw reply text", content)
+	}
+	wantExtra := "[replying to alice: hello world]"
+	if extraContent != wantExtra {
+		t.Fatalf("extra content = %q, want %q", extraContent, wantExtra)
 	}
 	if len(images) != 0 {
 		t.Fatalf("images = %v, want empty", images)
@@ -1448,10 +1451,10 @@ func TestApplyReferencedMessage_PrependsAuthorAndContent(t *testing.T) {
 
 func TestApplyReferencedMessage_NoAuthorUsesEmptyString(t *testing.T) {
 	ref := &discordgo.Message{Content: "anon msg"}
-	content, _ := applyReferencedMessage(ref, "reply", nil, nil)
+	_, extraContent, _ := applyReferencedMessage(ref, "reply", nil, nil)
 
-	if !strings.Contains(content, "[replying to : anon msg]") {
-		t.Fatalf("content = %q, want empty author placeholder", content)
+	if !strings.Contains(extraContent, "[replying to : anon msg]") {
+		t.Fatalf("extra content = %q, want empty author placeholder", extraContent)
 	}
 }
 
@@ -1469,7 +1472,7 @@ func TestApplyReferencedMessage_DownloadsAndPrependsImages(t *testing.T) {
 	}
 	existing := []core.ImageAttachment{{MimeType: "image/jpeg", Data: []byte("existing"), FileName: "old.jpg"}}
 
-	_, images := applyReferencedMessage(ref, "reply", existing, download)
+	_, _, images := applyReferencedMessage(ref, "reply", existing, download)
 
 	if len(images) != 2 {
 		t.Fatalf("images len = %d, want 2", len(images))
@@ -1496,7 +1499,7 @@ func TestApplyReferencedMessage_SkipsNonImageAttachments(t *testing.T) {
 		return nil, nil
 	}
 
-	_, images := applyReferencedMessage(ref, "reply", nil, download)
+	_, _, images := applyReferencedMessage(ref, "reply", nil, download)
 	if len(images) != 0 {
 		t.Fatalf("images = %v, want empty — PDF should not be forwarded as image", images)
 	}
@@ -1513,7 +1516,7 @@ func TestApplyReferencedMessage_SkipsFailedImageDownloads(t *testing.T) {
 		},
 	}
 
-	_, images := applyReferencedMessage(ref, "reply", nil, download)
+	_, _, images := applyReferencedMessage(ref, "reply", nil, download)
 	if len(images) != 0 {
 		t.Fatalf("images = %v, want empty — failed download should be skipped", images)
 	}
@@ -1696,4 +1699,3 @@ func basePlatformFor(t *testing.T, pAny core.Platform) *Platform {
 		return nil
 	}
 }
-

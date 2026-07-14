@@ -5994,6 +5994,48 @@ func TestHandleMessage_ExtraContentOnlyIsProcessed(t *testing.T) {
 	}
 }
 
+func TestHandleMessage_RepliedSteerRoutesBeforeExtraContent(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	key := "test:user1"
+	sess := &steerSession{}
+	session := e.sessions.GetOrCreateActive(key)
+	if !session.TryLock() {
+		t.Fatal("failed to mark session busy")
+	}
+	defer session.Unlock()
+
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = &interactiveState{agentSession: sess}
+	e.interactiveMu.Unlock()
+
+	e.handleMessage(p, &Message{
+		SessionKey:   key,
+		Platform:     "test",
+		UserID:       "user1",
+		Content:      "/steer focus on fork-only fixes",
+		ExtraContent: "[replying to Miro: prior response]",
+		ReplyCtx:     "ctx",
+	})
+
+	if sess.lastPrompt != "focus on fork-only fixes" {
+		t.Fatalf("steer prompt = %q, want raw command arguments", sess.lastPrompt)
+	}
+	sent := p.getSent()
+	if len(sent) != 1 || !strings.Contains(sent[0], e.i18n.T(MsgSteerSent)) {
+		t.Fatalf("sent = %#v, want steer acknowledgement only", sent)
+	}
+	e.interactiveMu.Lock()
+	state := e.interactiveStates[key]
+	e.interactiveMu.Unlock()
+	state.mu.Lock()
+	queued := len(state.pendingMessages)
+	state.mu.Unlock()
+	if queued != 0 {
+		t.Fatalf("queued messages = %d, want replied /steer routed immediately", queued)
+	}
+}
+
 func TestCmdDiff_RejectsDashTarget(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)

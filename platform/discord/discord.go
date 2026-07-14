@@ -47,7 +47,7 @@ type progressPlatform struct {
 type Platform struct {
 	token                      string
 	allowFrom                  string
-	guildID                    string   // optional: per-guild registration (instant) vs global (up to 1h propagation)
+	guildID                    string // optional: per-guild registration (instant) vs global (up to 1h propagation)
 	progressStyle              string
 	groupReplyAllGuilds        []string // guild IDs where groupReplyAll is active; "*" = all guilds
 	shareSessionInChannel      bool
@@ -667,9 +667,11 @@ func (p *Platform) buildSession() (*discordgo.Session, error) {
 			return
 		}
 
-		// Prepend the replied-to message's content and images so the agent has context.
+		// Keep reply context separate so slash commands are routed from the user's
+		// raw text before the engine enriches normal agent prompts.
+		extraContent := ""
 		if m.ReferencedMessage != nil {
-			m.Content, images = applyReferencedMessage(m.ReferencedMessage, m.Content, images, downloadURL)
+			m.Content, extraContent, images = applyReferencedMessage(m.ReferencedMessage, m.Content, images, downloadURL)
 		}
 
 		msg := &core.Message{
@@ -677,7 +679,8 @@ func (p *Platform) buildSession() (*discordgo.Session, error) {
 			ChannelID: m.ChannelID,
 			MessageID: m.ID,
 			UserID:    m.Author.ID, UserName: m.Author.Username,
-			Content: m.Content, Images: images, Files: files, Audio: audio, ReplyCtx: rctx,
+			Content: m.Content, ExtraContent: extraContent,
+			Images: images, Files: files, Audio: audio, ReplyCtx: rctx,
 		}
 		msg.ChatName, _ = p.ResolveChannelName(m.ChannelID)
 		p.dispatchMessage(msg)
@@ -848,7 +851,7 @@ func (p *Platform) handleInteraction(s *discordgo.Session, i *discordgo.Interact
 		MessageID: i.ID,
 		ChannelID: i.ChannelID,
 		UserID:    userID, UserName: userName,
-		Content:  cmdText, ReplyCtx: rctx,
+		Content: cmdText, ReplyCtx: rctx,
 	}
 	msg.ChatName, _ = p.ResolveChannelName(channelID)
 	p.dispatchMessage(msg)
@@ -1502,16 +1505,16 @@ func downloadURL(u string) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(resp.Body, maxDownloadBytes+1))
 }
 
-// applyReferencedMessage prepends the replied-to message's author and content
-// to content and prepends any images from the referenced message's attachments.
+// applyReferencedMessage returns the replied-to message as agent-only context
+// and prepends any images from the referenced message's attachments.
 // Image attachments (width > 0) are downloaded via download and prepended so the
 // agent sees them before the current message's own images.
-func applyReferencedMessage(ref *discordgo.Message, content string, images []core.ImageAttachment, download func(string) ([]byte, error)) (string, []core.ImageAttachment) {
+func applyReferencedMessage(ref *discordgo.Message, content string, images []core.ImageAttachment, download func(string) ([]byte, error)) (string, string, []core.ImageAttachment) {
 	author := ""
 	if ref.Author != nil {
 		author = ref.Author.Username
 	}
-	content = "[replying to " + author + ": " + ref.Content + "]\n" + content
+	extraContent := "[replying to " + author + ": " + ref.Content + "]"
 	for _, att := range ref.Attachments {
 		if att.Width > 0 && att.Height > 0 {
 			data, err := download(att.URL)
@@ -1524,5 +1527,5 @@ func applyReferencedMessage(ref *discordgo.Message, content string, images []cor
 			}}, images...)
 		}
 	}
-	return content, images
+	return content, extraContent, images
 }
