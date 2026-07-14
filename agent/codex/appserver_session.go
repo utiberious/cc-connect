@@ -36,6 +36,18 @@ type rpcError struct {
 	Message string `json:"message"`
 }
 
+func (e *rpcError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return strings.TrimSpace(e.Message)
+}
+
+const (
+	appServerInternalErrorCode  = -32603
+	deadAgentLoopTurnStartError = "failed to start turn: internal error; agent loop died unexpectedly"
+)
+
 type initResponse struct {
 	ProtocolVersion string `json:"protocolVersion"`
 }
@@ -516,6 +528,8 @@ func (s *appServerSession) Send(prompt string, images []core.ImageAttachment, fi
 			s.alive.Store(false)
 			return fmt.Errorf("codex app-server turn/start fresh thread recovery after %v: %w", err, recoveryErr)
 		}
+		recovered = true
+		s.emit(core.Event{Type: core.EventSessionRecovered, SessionID: s.CurrentSessionID()})
 
 		if !preambleAdded {
 			prompt = prependCodexPromptPreamble(prompt, s.promptPreamble)
@@ -527,7 +541,6 @@ func (s *appServerSession) Send(prompt string, images []core.ImageAttachment, fi
 			s.alive.Store(false)
 			return fmt.Errorf("codex app-server turn/start fresh thread recovery retry after %v: %w", err, recoveryErr)
 		}
-		recovered = true
 	}
 	if resp.Turn.ID == "" {
 		if recovered {
@@ -542,9 +555,6 @@ func (s *appServerSession) Send(prompt string, images []core.ImageAttachment, fi
 	s.fallbackMsgs = s.fallbackMsgs[:0]
 	clear(s.functionCalls)
 	s.stateMu.Unlock()
-	if recovered {
-		s.emit(core.Event{Type: core.EventSessionRecovered, SessionID: s.CurrentSessionID()})
-	}
 
 	return nil
 }
@@ -1208,19 +1218,6 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 			s.completeTurn(notif.Turn.ID, turnCompletionError(notif))
 		}
 
-	case "thread/status/changed":
-		var notif struct {
-			ThreadID string `json:"threadId"`
-			Status   struct {
-				Type string `json:"type"`
-			} `json:"status"`
-		}
-		if err := json.Unmarshal(paramsRaw, &notif); err == nil &&
-			notif.Status.Type == "idle" && s.isCurrentThread(notif.ThreadID) {
-			// In codex 0.125+, thread going idle signals turn completion.
-			s.completeTurn("", nil)
-		}
-
 	case "account/rateLimits/updated":
 		var notif appServerRateLimitsResponse
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
@@ -1671,7 +1668,10 @@ func turnCompletionError(notif turnNotification) error {
 }
 
 func isDeadAgentLoopError(err error) bool {
-	return err != nil && strings.Contains(strings.ToLower(err.Error()), "agent loop died unexpectedly")
+	var rpcErr *rpcError
+	return errors.As(err, &rpcErr) &&
+		rpcErr.Code == appServerInternalErrorCode &&
+		rpcErr.Error() == deadAgentLoopTurnStartError
 }
 
 func (s *appServerSession) flushPendingAsThinking() {
@@ -1799,7 +1799,7 @@ func (s *appServerSession) requestWithTimeout(method string, params any, out any
 	select {
 	case resp := <-ch:
 		if resp.Error != nil {
-			return fmt.Errorf("%s", strings.TrimSpace(resp.Error.Message))
+			return resp.Error
 		}
 		if out != nil {
 			if err := json.Unmarshal(resp.Result, out); err != nil {
