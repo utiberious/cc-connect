@@ -1129,6 +1129,16 @@ func (s *piSession) Alive() bool {
 	return s.alive.Load()
 }
 
+// Steer sends additional guidance to the currently active pi turn.
+// In RPC mode: writes a "prompt" command on stdin (reuses sendRPC).
+// In JSON mode: returns an error (one-shot processes can't be steered mid-turn).
+func (s *piSession) Steer(prompt string) error {
+	if !s.rpc {
+		return fmt.Errorf("pi: steer is only available in RPC mode")
+	}
+	return s.sendRPC(prompt)
+}
+
 func (s *piSession) Close() error {
 	s.alive.Store(false)
 
