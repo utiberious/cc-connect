@@ -67,6 +67,36 @@ type stubPlatformEngine struct {
 	mu   sync.Mutex
 }
 
+type stubAcknowledgingPlatform struct {
+	stubPlatformEngine
+	handled bool
+	acks    []MessageAckKind
+}
+
+func (p *stubAcknowledgingPlatform) AcknowledgeMessage(_ any, kind MessageAckKind) bool {
+	p.acks = append(p.acks, kind)
+	return p.handled
+}
+
+type observingPlatform struct {
+	stubPlatformEngine
+	observe func(string)
+}
+
+func (p *observingPlatform) Reply(ctx context.Context, replyCtx any, content string) error {
+	if p.observe != nil {
+		p.observe(content)
+	}
+	return p.stubPlatformEngine.Reply(ctx, replyCtx, content)
+}
+
+func (p *observingPlatform) Send(ctx context.Context, replyCtx any, content string) error {
+	if p.observe != nil {
+		p.observe(content)
+	}
+	return p.stubPlatformEngine.Send(ctx, replyCtx, content)
+}
+
 func (p *stubPlatformEngine) Name() string               { return p.n }
 func (p *stubPlatformEngine) Start(MessageHandler) error { return nil }
 func (p *stubPlatformEngine) Reply(_ context.Context, _ any, content string) error {
@@ -1625,6 +1655,94 @@ func TestProcessInteractiveEvents_HiddenToolProgressKeepsPreviewOnFinalize(t *te
 	}
 	if len(previewMsgs) == 0 || previewMsgs[len(previewMsgs)-1] != "update:final response" {
 		t.Fatalf("preview messages = %#v, want in-place final update", previewMsgs)
+	}
+}
+
+func TestProcessInteractiveEvents_SessionRecoveryIsVisible(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "sessions.json")
+	sessionKey := "discord:user1"
+	persistedBeforeFinal := false
+	p := &observingPlatform{stubPlatformEngine: stubPlatformEngine{n: "discord"}}
+	p.observe = func(content string) {
+		if content != "review complete" {
+			return
+		}
+		reloaded := NewSessionManager(storePath)
+		persistedBeforeFinal = reloaded.GetOrCreateActive(sessionKey).GetAgentSessionID() == "thread-new"
+	}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.sessions = NewSessionManager(storePath)
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("thread-new")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-1",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventSessionRecovered, SessionID: "thread-new"}
+	agentSession.events <- Event{Type: EventResult, Content: "review complete", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-recovered", time.Now(), nil, nil, nil)
+
+	sent := p.getSent()
+	if len(sent) != 2 {
+		t.Fatalf("sent = %#v, want recovery warning and final reply", sent)
+	}
+	if !strings.Contains(sent[0], "session became unusable") || !strings.Contains(sent[0], "context may be incomplete") {
+		t.Fatalf("recovery warning = %q", sent[0])
+	}
+	if sent[1] != "review complete" {
+		t.Fatalf("final reply = %q, want review complete", sent[1])
+	}
+	if !persistedBeforeFinal {
+		t.Fatal("replacement session ID was not persisted before final reply delivery")
+	}
+	if got := session.GetAgentSessionID(); got != "thread-new" {
+		t.Fatalf("persisted agent session ID = %q, want thread-new", got)
+	}
+	history := session.GetHistory(0)
+	if len(history) != 1 || history[0].Role != "assistant" || history[0].Content != "review complete" {
+		t.Fatalf("history = %#v, want only the final assistant reply", history)
+	}
+}
+
+func TestProcessInteractiveEvents_SessionRecoveryStaysOutsideRichCard(t *testing.T) {
+	p := &stubRichCardSilentPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{CardMode: "rich", ThinkingMessages: true, ToolMessages: true})
+	sessionKey := "feishu:user1"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("thread-new")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-1",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventSessionRecovered, SessionID: "thread-new"}
+	agentSession.events <- Event{Type: EventText, Content: "review complete"}
+	agentSession.events <- Event{Type: EventResult, Content: "review complete", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-recovered", time.Now(), nil, nil, nil)
+
+	sent := p.getSent()
+	if len(sent) != 1 || !strings.Contains(sent[0], "session became unusable") {
+		t.Fatalf("plain sends = %#v, want only the recovery warning", sent)
+	}
+	starts, streams, updates, _ := p.snapshot()
+	rendered := strings.Join(append(append(starts, streams...), updates...), "\n")
+	if !strings.Contains(rendered, "review complete") {
+		t.Fatalf("rich card output = %q, want final answer", rendered)
+	}
+	if strings.Contains(rendered, "session became unusable") || strings.Contains(rendered, "context may be incomplete") {
+		t.Fatalf("recovery warning leaked into rich card output: %q", rendered)
+	}
+	history := session.GetHistory(0)
+	if len(history) != 1 || history[0].Content != "review complete" {
+		t.Fatalf("history = %#v, want only the final assistant reply", history)
 	}
 }
 
@@ -5887,6 +6005,48 @@ func TestHandleMessage_ExtraContentOnlyIsProcessed(t *testing.T) {
 	}
 }
 
+func TestHandleMessage_RepliedSteerRoutesBeforeExtraContent(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	key := "test:user1"
+	sess := &steerSession{}
+	session := e.sessions.GetOrCreateActive(key)
+	if !session.TryLock() {
+		t.Fatal("failed to mark session busy")
+	}
+	defer session.Unlock()
+
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = &interactiveState{agentSession: sess}
+	e.interactiveMu.Unlock()
+
+	e.handleMessage(p, &Message{
+		SessionKey:   key,
+		Platform:     "test",
+		UserID:       "user1",
+		Content:      "/steer focus on fork-only fixes",
+		ExtraContent: "[replying to Miro: prior response]",
+		ReplyCtx:     "ctx",
+	})
+
+	if sess.lastPrompt != "focus on fork-only fixes" {
+		t.Fatalf("steer prompt = %q, want raw command arguments", sess.lastPrompt)
+	}
+	sent := p.getSent()
+	if len(sent) != 1 || !strings.Contains(sent[0], e.i18n.T(MsgSteerSent)) {
+		t.Fatalf("sent = %#v, want steer acknowledgement only", sent)
+	}
+	e.interactiveMu.Lock()
+	state := e.interactiveStates[key]
+	e.interactiveMu.Unlock()
+	state.mu.Lock()
+	queued := len(state.pendingMessages)
+	state.mu.Unlock()
+	if queued != 0 {
+		t.Fatalf("queued messages = %d, want replied /steer routed immediately", queued)
+	}
+}
+
 func TestCmdDiff_RejectsDashTarget(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
@@ -7118,6 +7278,28 @@ type controllableAgentSession struct {
 	usageErr        error
 }
 
+type unhealthySendAgentSession struct {
+	controllableAgentSession
+	err error
+}
+
+func newUnhealthySendSession(id string, err error) *unhealthySendAgentSession {
+	return &unhealthySendAgentSession{
+		controllableAgentSession: controllableAgentSession{
+			sessionID: id,
+			alive:     true,
+			events:    make(chan Event, 8),
+			closed:    make(chan struct{}),
+		},
+		err: err,
+	}
+}
+
+func (s *unhealthySendAgentSession) Send(_ string, _ []ImageAttachment, _ []FileAttachment) error {
+	s.alive = false
+	return s.err
+}
+
 func newControllableSession(id string) *controllableAgentSession {
 	return &controllableAgentSession{
 		sessionID: id,
@@ -7414,6 +7596,41 @@ func TestProcessInteractiveMessage_SchedulesAgentSessionIdleCloseAfterCleanTurn(
 
 	waitForAgentSessionID(t, session, "result-session")
 	waitForInteractiveStateRemoved(t, e, "test:chat:user1")
+}
+
+func TestProcessInteractiveMessage_UnhealthySendClosesAndRemovesSession(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newUnhealthySendSession("dead-session", errors.New("fresh thread recovery retry failed"))
+	agent := &controllableAgent{nextSession: sess}
+	e := NewEngine("test", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	key := "test:chat:user1"
+	session := e.sessions.GetOrCreateActive(key)
+	if !session.TryLock() {
+		t.Fatal("failed to lock session")
+	}
+
+	e.processInteractiveMessageWith(p, &Message{
+		Platform:   "test",
+		SessionKey: key,
+		UserID:     "user1",
+		Content:    "continue",
+		ReplyCtx:   "ctx",
+	}, session, agent, e.sessions, key, "", "")
+
+	select {
+	case <-sess.closed:
+	default:
+		t.Fatal("unhealthy session was not closed after send failure")
+	}
+	e.interactiveMu.Lock()
+	state := e.interactiveStates[key]
+	e.interactiveMu.Unlock()
+	if state != nil {
+		t.Fatal("unhealthy session state remained after send failure")
+	}
+	if sent := p.getSent(); len(sent) != 1 || !strings.Contains(sent[0], "fresh thread recovery retry failed") {
+		t.Fatalf("sent = %#v, want localized send failure", sent)
+	}
 }
 
 // TestCleanupCAS_ConcurrentUnconditionalCloseOnce verifies that two concurrent
@@ -9510,6 +9727,29 @@ func TestExecuteCardAction_ModeCleansUpWithInteractiveKey(t *testing.T) {
 
 // --- 1. Message queue overflow ---
 
+func TestQueueMessageForBusySession_UsesPlatformAcknowledgement(t *testing.T) {
+	p := &stubAcknowledgingPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "test"},
+		handled:            true,
+	}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	key := "test:queued-ack"
+	state := &interactiveState{agentSession: &stubAgentSession{}, platform: p, replyCtx: "ctx"}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	if !e.queueMessageForBusySession(p, &Message{SessionKey: key, Content: "next", ReplyCtx: "ctx"}, key) {
+		t.Fatal("message was not queued")
+	}
+	if len(p.acks) != 1 || p.acks[0] != MessageAckQueued {
+		t.Fatalf("acknowledgements = %#v, want queued reaction", p.acks)
+	}
+	if sent := p.getSent(); len(sent) != 0 {
+		t.Fatalf("text replies = %#v, want reaction only", sent)
+	}
+}
+
 func TestQueueMessageOverflow_DropsOldestAndReturnsfalse(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	sess := newQueuingSession("qs-overflow")
@@ -10737,6 +10977,58 @@ func TestCmdSteer_Success_SendsGuidance(t *testing.T) {
 	}
 	if !strings.Contains(sent[0], e.i18n.T(MsgSteerSent)) {
 		t.Fatalf("expected MsgSteerSent, got %q", sent[0])
+	}
+}
+
+func TestCmdSteer_Success_UsesPlatformAcknowledgement(t *testing.T) {
+	p := &stubAcknowledgingPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "test"},
+		handled:            true,
+	}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	key := "test:user1"
+	sess := &steerSession{}
+	session := e.sessions.GetOrCreateActive(key)
+	if !session.TryLock() {
+		t.Fatal("failed to mark session busy")
+	}
+	defer session.Unlock()
+
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = &interactiveState{agentSession: sess}
+	e.interactiveMu.Unlock()
+
+	msg := &Message{SessionKey: key, Content: "/steer focus", ReplyCtx: "ctx"}
+	if !e.cmdSteer(p, msg, []string{"focus"}) {
+		t.Fatal("busy steer should be handled")
+	}
+	if len(p.acks) != 1 || p.acks[0] != MessageAckSteered {
+		t.Fatalf("acknowledgements = %#v, want steer reaction", p.acks)
+	}
+	if sent := p.getSent(); len(sent) != 0 {
+		t.Fatalf("text replies = %#v, want reaction only", sent)
+	}
+}
+
+func TestCmdSteer_AcknowledgementFailureFallsBackToText(t *testing.T) {
+	p := &stubAcknowledgingPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	key := "test:user1"
+	session := e.sessions.GetOrCreateActive(key)
+	if !session.TryLock() {
+		t.Fatal("failed to mark session busy")
+	}
+	defer session.Unlock()
+
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = &interactiveState{agentSession: &steerSession{}}
+	e.interactiveMu.Unlock()
+
+	if !e.cmdSteer(p, &Message{SessionKey: key, ReplyCtx: "ctx"}, []string{"focus"}) {
+		t.Fatal("busy steer should be handled")
+	}
+	if sent := p.getSent(); len(sent) != 1 || !strings.Contains(sent[0], e.i18n.T(MsgSteerSent)) {
+		t.Fatalf("text replies = %#v, want fallback acknowledgement", sent)
 	}
 }
 

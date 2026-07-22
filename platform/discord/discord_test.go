@@ -649,6 +649,53 @@ func TestNew_ProgressStyleRejectsInvalidValue(t *testing.T) {
 	}
 }
 
+func TestNew_ConfiguresAcknowledgementStyle(t *testing.T) {
+	pAny, err := New(map[string]any{
+		"token":           "discord-token",
+		"ack_style":       "reaction",
+		"steer_ack_emoji": "🧭",
+		"queue_ack_emoji": "⏳",
+		"progress_style":  "card",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	p := basePlatformFor(t, pAny)
+	if p.ackStyle != "reaction" || p.steerAckEmoji != "🧭" || p.queueAckEmoji != "⏳" {
+		t.Fatalf("ack config = (%q, %q, %q)", p.ackStyle, p.steerAckEmoji, p.queueAckEmoji)
+	}
+}
+
+func TestNew_RejectsInvalidAcknowledgementStyle(t *testing.T) {
+	_, err := New(map[string]any{"token": "discord-token", "ack_style": "embed"})
+	if err == nil || !strings.Contains(err.Error(), "invalid ack_style") {
+		t.Fatalf("New() error = %v, want invalid ack_style", err)
+	}
+}
+
+func TestAcknowledgeMessage_AddsConfiguredReaction(t *testing.T) {
+	var method, path string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method = r.Method
+		path = r.URL.Path
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	p := &Platform{
+		ackStyle:      "reaction",
+		steerAckEmoji: "🧭",
+		queueAckEmoji: "⏳",
+		session:       newTestDiscordSession(t, server),
+	}
+	if !p.AcknowledgeMessage(replyContext{channelID: "channel-1", messageID: "message-1"}, core.MessageAckSteered) {
+		t.Fatal("AcknowledgeMessage() = false, want reaction handled")
+	}
+	if method != http.MethodPut || !strings.Contains(path, "/channels/channel-1/messages/message-1/reactions/🧭/@me") {
+		t.Fatalf("reaction request = %s %q", method, path)
+	}
+}
+
 func TestNew_LegacyProgressStyleDoesNotEnableProgressInterfaces(t *testing.T) {
 	pAny, err := New(map[string]any{
 		"token":          "discord-token",
@@ -1435,11 +1482,14 @@ func TestApplyReferencedMessage_PrependsAuthorAndContent(t *testing.T) {
 		Author:  &discordgo.User{Username: "alice"},
 		Content: "hello world",
 	}
-	content, images := applyReferencedMessage(ref, "my reply", nil, nil)
+	content, extraContent, images := applyReferencedMessage(ref, "my reply", nil, nil)
 
-	wantContent := "[replying to alice: hello world]\nmy reply"
-	if content != wantContent {
-		t.Fatalf("content = %q, want %q", content, wantContent)
+	if content != "my reply" {
+		t.Fatalf("content = %q, want raw reply text", content)
+	}
+	wantExtra := "[replying to alice: hello world]"
+	if extraContent != wantExtra {
+		t.Fatalf("extra content = %q, want %q", extraContent, wantExtra)
 	}
 	if len(images) != 0 {
 		t.Fatalf("images = %v, want empty", images)
@@ -1448,10 +1498,10 @@ func TestApplyReferencedMessage_PrependsAuthorAndContent(t *testing.T) {
 
 func TestApplyReferencedMessage_NoAuthorUsesEmptyString(t *testing.T) {
 	ref := &discordgo.Message{Content: "anon msg"}
-	content, _ := applyReferencedMessage(ref, "reply", nil, nil)
+	_, extraContent, _ := applyReferencedMessage(ref, "reply", nil, nil)
 
-	if !strings.Contains(content, "[replying to : anon msg]") {
-		t.Fatalf("content = %q, want empty author placeholder", content)
+	if !strings.Contains(extraContent, "[replying to : anon msg]") {
+		t.Fatalf("extra content = %q, want empty author placeholder", extraContent)
 	}
 }
 
@@ -1469,7 +1519,7 @@ func TestApplyReferencedMessage_DownloadsAndPrependsImages(t *testing.T) {
 	}
 	existing := []core.ImageAttachment{{MimeType: "image/jpeg", Data: []byte("existing"), FileName: "old.jpg"}}
 
-	_, images := applyReferencedMessage(ref, "reply", existing, download)
+	_, _, images := applyReferencedMessage(ref, "reply", existing, download)
 
 	if len(images) != 2 {
 		t.Fatalf("images len = %d, want 2", len(images))
@@ -1496,7 +1546,7 @@ func TestApplyReferencedMessage_SkipsNonImageAttachments(t *testing.T) {
 		return nil, nil
 	}
 
-	_, images := applyReferencedMessage(ref, "reply", nil, download)
+	_, _, images := applyReferencedMessage(ref, "reply", nil, download)
 	if len(images) != 0 {
 		t.Fatalf("images = %v, want empty — PDF should not be forwarded as image", images)
 	}
@@ -1513,7 +1563,7 @@ func TestApplyReferencedMessage_SkipsFailedImageDownloads(t *testing.T) {
 		},
 	}
 
-	_, images := applyReferencedMessage(ref, "reply", nil, download)
+	_, _, images := applyReferencedMessage(ref, "reply", nil, download)
 	if len(images) != 0 {
 		t.Fatalf("images = %v, want empty — failed download should be skipped", images)
 	}
@@ -1696,4 +1746,3 @@ func basePlatformFor(t *testing.T, pAny core.Platform) *Platform {
 		return nil
 	}
 }
-

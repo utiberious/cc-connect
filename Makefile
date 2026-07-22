@@ -34,7 +34,7 @@ PLATFORMS := \
 # ---------------------------------------------------------------------------
 
 ALL_AGENTS    := acp antigravity claudecode codex copilot cursor devin gemini iflow kimi opencode pi qoder reasonix tmux
-ALL_PLATFORMS := feishu telegram discord slack dingtalk wecom weixin qq qqbot line weibo max matrix webex cloud_web zulip
+ALL_PLATFORMS := feishu telegram discord slack dingtalk wecom weixin qq qqbot line weibo max matrix webex cloud_web zulip wps-agentspace
 ALL_EXTRAS    := web
 
 COMMA := ,
@@ -45,17 +45,17 @@ _EXCLUDE_TAGS :=
 ifdef AGENTS
   _WANTED_AGENTS := $(subst $(COMMA), ,$(AGENTS))
   _EXCLUDE_AGENTS := $(filter-out $(_WANTED_AGENTS),$(ALL_AGENTS))
-  _EXCLUDE_TAGS += $(addprefix no_,$(_EXCLUDE_AGENTS))
+  _EXCLUDE_TAGS += $(subst -,_,$(addprefix no_,$(_EXCLUDE_AGENTS)))
 endif
 
 ifdef PLATFORMS_INCLUDE
   _WANTED_PLATFORMS := $(subst $(COMMA), ,$(PLATFORMS_INCLUDE))
   _EXCLUDE_PLATFORMS := $(filter-out $(_WANTED_PLATFORMS),$(ALL_PLATFORMS))
-  _EXCLUDE_TAGS += $(addprefix no_,$(_EXCLUDE_PLATFORMS))
+  _EXCLUDE_TAGS += $(subst -,_,$(addprefix no_,$(_EXCLUDE_PLATFORMS)))
 endif
 
 ifdef EXCLUDE
-  _EXCLUDE_TAGS += $(addprefix no_,$(subst $(COMMA), ,$(EXCLUDE)))
+  _EXCLUDE_TAGS += $(subst -,_,$(addprefix no_,$(subst $(COMMA), ,$(EXCLUDE))))
 endif
 
 ifdef NO_WEB

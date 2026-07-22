@@ -47,12 +47,15 @@ type progressPlatform struct {
 type Platform struct {
 	token                      string
 	allowFrom                  string
-	guildID                    string   // optional: per-guild registration (instant) vs global (up to 1h propagation)
+	guildID                    string // optional: per-guild registration (instant) vs global (up to 1h propagation)
 	progressStyle              string
 	groupReplyAllGuilds        []string // guild IDs where groupReplyAll is active; "*" = all guilds
 	shareSessionInChannel      bool
 	threadIsolation            bool
 	respondToAtEveryoneAndHere bool
+	ackStyle                   string
+	steerAckEmoji              string
+	queueAckEmoji              string
 	proxyURL                   *url.URL
 	handler                    core.MessageHandler
 	botID                      string
@@ -98,6 +101,24 @@ func New(opts map[string]any) (core.Platform, error) {
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 	threadIsolation, _ := opts["thread_isolation"].(bool)
 	respondToAtEveryoneAndHere, _ := opts["respond_to_at_everyone_and_here"].(bool)
+	ackStyle := "message"
+	if v, ok := opts["ack_style"].(string); ok {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "", "message":
+		case "reaction":
+			ackStyle = "reaction"
+		default:
+			return nil, fmt.Errorf("discord: invalid ack_style %q (want message or reaction)", v)
+		}
+	}
+	steerAckEmoji := "🧭"
+	if v, ok := opts["steer_ack_emoji"].(string); ok && strings.TrimSpace(v) != "" {
+		steerAckEmoji = strings.TrimSpace(v)
+	}
+	queueAckEmoji := "⏳"
+	if v, ok := opts["queue_ack_emoji"].(string); ok && strings.TrimSpace(v) != "" {
+		queueAckEmoji = strings.TrimSpace(v)
+	}
 	// Default to "compact" so streaming edits work out of the box (Discord
 	// supports MessageUpdater.UpdateMessage). Users can opt back into the old
 	// "send entire reply at once" behavior with progress_style = "legacy".
@@ -138,6 +159,9 @@ func New(opts map[string]any) (core.Platform, error) {
 		readyCh:                    make(chan struct{}),
 		threadIsolation:            threadIsolation,
 		respondToAtEveryoneAndHere: respondToAtEveryoneAndHere,
+		ackStyle:                   ackStyle,
+		steerAckEmoji:              steerAckEmoji,
+		queueAckEmoji:              queueAckEmoji,
 		proxyURL:                   proxyU,
 	}
 	if progressStyle == "compact" || progressStyle == "card" {
@@ -150,6 +174,50 @@ func New(opts map[string]any) (core.Platform, error) {
 }
 
 func (p *Platform) Name() string { return "discord" }
+
+func (p *Platform) AcknowledgeMessage(replyCtx any, kind core.MessageAckKind) bool {
+	if p.ackStyle != "reaction" {
+		return false
+	}
+
+	var rc replyContext
+	switch v := replyCtx.(type) {
+	case replyContext:
+		rc = v
+	case *replyContext:
+		if v == nil {
+			return false
+		}
+		rc = *v
+	default:
+		return false
+	}
+	if rc.channelID == "" || rc.messageID == "" {
+		return false
+	}
+
+	emoji := ""
+	switch kind {
+	case core.MessageAckSteered:
+		emoji = p.steerAckEmoji
+	case core.MessageAckQueued:
+		emoji = p.queueAckEmoji
+	default:
+		return false
+	}
+
+	p.mu.RLock()
+	session := p.session
+	p.mu.RUnlock()
+	if session == nil {
+		return false
+	}
+	if err := session.MessageReactionAdd(rc.channelID, rc.messageID, emoji); err != nil {
+		slog.Debug("discord: acknowledgement reaction failed", "kind", kind, "emoji", emoji, "error", err)
+		return false
+	}
+	return true
+}
 
 func (p *Platform) selfPlatform() core.Platform {
 	if p != nil && p.self != nil {
@@ -667,9 +735,11 @@ func (p *Platform) buildSession() (*discordgo.Session, error) {
 			return
 		}
 
-		// Prepend the replied-to message's content and images so the agent has context.
+		// Keep reply context separate so slash commands are routed from the user's
+		// raw text before the engine enriches normal agent prompts.
+		extraContent := ""
 		if m.ReferencedMessage != nil {
-			m.Content, images = applyReferencedMessage(m.ReferencedMessage, m.Content, images, downloadURL)
+			m.Content, extraContent, images = applyReferencedMessage(m.ReferencedMessage, m.Content, images, downloadURL)
 		}
 
 		msg := &core.Message{
@@ -677,7 +747,8 @@ func (p *Platform) buildSession() (*discordgo.Session, error) {
 			ChannelID: m.ChannelID,
 			MessageID: m.ID,
 			UserID:    m.Author.ID, UserName: m.Author.Username,
-			Content: m.Content, Images: images, Files: files, Audio: audio, ReplyCtx: rctx,
+			Content: m.Content, ExtraContent: extraContent,
+			Images: images, Files: files, Audio: audio, ReplyCtx: rctx,
 		}
 		msg.ChatName, _ = p.ResolveChannelName(m.ChannelID)
 		p.dispatchMessage(msg)
@@ -848,7 +919,7 @@ func (p *Platform) handleInteraction(s *discordgo.Session, i *discordgo.Interact
 		MessageID: i.ID,
 		ChannelID: i.ChannelID,
 		UserID:    userID, UserName: userName,
-		Content:  cmdText, ReplyCtx: rctx,
+		Content: cmdText, ReplyCtx: rctx,
 	}
 	msg.ChatName, _ = p.ResolveChannelName(channelID)
 	p.dispatchMessage(msg)
@@ -1502,16 +1573,16 @@ func downloadURL(u string) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(resp.Body, maxDownloadBytes+1))
 }
 
-// applyReferencedMessage prepends the replied-to message's author and content
-// to content and prepends any images from the referenced message's attachments.
+// applyReferencedMessage returns the replied-to message as agent-only context
+// and prepends any images from the referenced message's attachments.
 // Image attachments (width > 0) are downloaded via download and prepended so the
 // agent sees them before the current message's own images.
-func applyReferencedMessage(ref *discordgo.Message, content string, images []core.ImageAttachment, download func(string) ([]byte, error)) (string, []core.ImageAttachment) {
+func applyReferencedMessage(ref *discordgo.Message, content string, images []core.ImageAttachment, download func(string) ([]byte, error)) (string, string, []core.ImageAttachment) {
 	author := ""
 	if ref.Author != nil {
 		author = ref.Author.Username
 	}
-	content = "[replying to " + author + ": " + ref.Content + "]\n" + content
+	extraContent := "[replying to " + author + ": " + ref.Content + "]"
 	for _, att := range ref.Attachments {
 		if att.Width > 0 && att.Height > 0 {
 			data, err := download(att.URL)
@@ -1524,5 +1595,5 @@ func applyReferencedMessage(ref *discordgo.Message, content string, images []cor
 			}}, images...)
 		}
 	}
-	return content, images
+	return content, extraContent, images
 }
