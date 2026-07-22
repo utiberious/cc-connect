@@ -5005,6 +5005,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				if e.display.Mode == "quiet" {
 					if sp.canPreview() && sp.appendSeparator("\n\n") {
 						textParts = append(textParts, "\n\n")
+						segmentStart = len(textParts)
 					}
 				} else {
 					if sp.canPreview() {
@@ -5092,6 +5093,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				if e.display.Mode == "quiet" {
 					if sp.canPreview() && sp.appendSeparator("\n\n") {
 						textParts = append(textParts, "\n\n")
+						segmentStart = len(textParts)
 					}
 				} else {
 					if sp.canPreview() {
